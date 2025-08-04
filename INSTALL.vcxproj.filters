@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\code\CyberSecirity\RealTimeMemoryAttackDetectEngine\CMakeFiles\adcb6d160dfce79fc6957716b17f7633\INSTALL_force.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{58963F0E-FA75-3B5A-96F6-E8CE39573761}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

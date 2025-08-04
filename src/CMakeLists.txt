@@ -1,54 +1,132 @@
-# 源碼目錄CMakeLists.txt
+# 真實記憶體攻擊檢測引擎源代碼
 
-# 包含目錄
-include_directories(${CMAKE_SOURCE_DIR}/include)
-include_directories(${CMAKE_SOURCE_DIR}/src)
-
-# 引擎核心
-add_subdirectory(engine)
-
-# MTE擴展支援
-add_subdirectory(mte)
-
-# LLVM插樁工具
-add_subdirectory(llvm_instrument)
-
-# 攻擊模式庫
-add_subdirectory(patterns)
-
-# 創建主庫
-add_library(memory_detection_engine
-    engine/memory_detection_engine.cpp
-    engine/performance_monitor.cpp
-    mte/mte_manager.cpp
-    llvm_instrument/llvm_instrumentation.cpp
-    patterns/pattern_matcher.cpp
-    patterns/rop_patterns.cpp
-    patterns/jop_patterns.cpp
-    utils/logger.cpp
-    utils/memory_utils.cpp
-    utils/thread_utils.cpp
+# 創建靜態庫
+add_library(real_memory_detection_engine STATIC
+    real_memory_detection_utils.cpp
+    real_memory_detection_engine.cpp
+    real_memory_detection_veh.cpp
+    real_memory_detection_logger.cpp
+    detection_engine.cpp
+    memory_monitor.cpp
+    logger.cpp
+    performance_monitor.cpp
 )
 
 # 設定目標屬性
-set_target_properties(memory_detection_engine PROPERTIES
-    CXX_STANDARD 23
-    CXX_STANDARD_REQUIRED ON
+set_target_properties(real_memory_detection_engine PROPERTIES
     VERSION ${PROJECT_VERSION}
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-# 條件性連結LLVM庫
-if(LLVM_FOUND AND llvm_libs)
-    target_link_libraries(memory_detection_engine ${llvm_libs})
-    message(STATUS "Linking with LLVM libraries")
-else()
-    message(STATUS "LLVM libraries not available, some features will be disabled")
+# 包含目錄
+target_include_directories(real_memory_detection_engine PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(real_memory_detection_engine
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
 endif()
 
-# 平台特定設定
+# 創建檢測引擎可執行檔
+add_executable(real_detection_engine
+    detection_engine.cpp
+    logger.cpp
+    performance_monitor.cpp
+)
+
+# 設定檢測引擎可執行檔屬性
+set_target_properties(real_detection_engine PROPERTIES
+    OUTPUT_NAME "real_detection_engine"
+)
+
+# 包含目錄
+target_include_directories(real_detection_engine PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(real_detection_engine
+    real_memory_detection_engine
+)
+
+# 鏈接Windows API庫
 if(WIN32)
-    target_link_libraries(memory_detection_engine psapi)
-elseif(UNIX)
-    target_link_libraries(memory_detection_engine pthread)
+    target_link_libraries(real_detection_engine
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
+# 創建攻擊模擬器可執行檔
+add_executable(attack_simulator
+    attack_simulator.cpp
+)
+
+# 設定攻擊模擬器屬性
+set_target_properties(attack_simulator PROPERTIES
+    OUTPUT_NAME "attack_simulator"
+)
+
+# 包含目錄
+target_include_directories(attack_simulator PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(attack_simulator
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
+# 創建記憶體監控器可執行檔
+add_executable(memory_monitor
+    memory_monitor_main.cpp
+    memory_monitor.cpp
+    logger.cpp
+    performance_monitor.cpp
+)
+
+# 設定記憶體監控器屬性
+set_target_properties(memory_monitor PROPERTIES
+    OUTPUT_NAME "memory_monitor"
+)
+
+# 包含目錄
+target_include_directories(memory_monitor PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(memory_monitor
+    real_memory_detection_engine
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(memory_monitor
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
 endif() 
