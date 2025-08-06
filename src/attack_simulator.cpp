@@ -13,9 +13,28 @@
 #include <conio.h>
 #include <vector> // Added for corrupted_blocks
 
+// 模擬器標記常量
+constexpr DWORD SIMULATOR_MAGIC = 0x53494D55; // 'SIMU'
+
 // 函數聲明
 bool verify_memory_content(LPVOID address, size_t size);
 std::string get_current_process_name();
+void log_message(const char* level, const char* message);
+
+// 動態標記註冊函數
+void register_simulator_flag() {
+    LPVOID flag_addr = VirtualAlloc(nullptr, 4, MEM_COMMIT, PAGE_READWRITE);
+    if (flag_addr) {
+        WriteProcessMemory(GetCurrentProcess(), flag_addr, &SIMULATOR_MAGIC, 4, nullptr);
+        VirtualProtect(flag_addr, 4, PAGE_READONLY, nullptr);
+        std::stringstream ss;
+        ss << "Simulator flag registered at address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << (uintptr_t)flag_addr;
+        std::string message = ss.str();
+        log_message("DEBUG", message.c_str());
+    } else {
+        log_message("ERROR", "Failed to register simulator flag");
+    }
+}
 
 // 全局變數
 static bool g_running = false;
@@ -42,96 +61,101 @@ void log_message(const char* level, const char* message) {
     
     std::string log_entry = ss.str() + " [" + level + "] " + message + "\n";
     
+    // 寫入到攻擊模擬器的log檔案
     if (g_log_file.is_open()) {
         g_log_file << log_entry;
         g_log_file.flush();
     }
     
+    // 同時寫入到檢測引擎的log檔案，讓記憶體位址可以在檢測引擎log中找到
+    std::ofstream detection_log("detection_engine.log", std::ios::app);
+    if (detection_log.is_open()) {
+        detection_log << log_entry;
+        detection_log.flush();
+        detection_log.close();
+    }
+    
     std::cout << log_entry;
 }
 
-// ROP攻擊模擬
+// 在 simulate_rop_attack() 中添加更明顯的ROP特徵
 void simulate_rop_attack() {
-    log_message("ATTACK", "Starting ROP attack simulation");
+    log_message("ATTACK", "Starting enhanced ROP attack simulation");
     
-    // 分配更大的可執行記憶體
-    LPVOID exec_mem = VirtualAlloc(NULL, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // 創建一個大的ROP gadget區域
+    LPVOID exec_mem = VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!exec_mem) {
         log_message("ERROR", "Failed to allocate executable memory");
         return;
     }
-
-    // 記錄分配的地址
-    std::stringstream ss;
-    ss << "Allocated executable memory at address: 0x" << std::hex << exec_mem;
-    log_message("DEBUG", ss.str().c_str());
     
-    uint8_t* chain_ptr = (uint8_t*)exec_mem;
+    uint8_t* ptr = (uint8_t*)exec_mem;
+    int offset = 0;
     
-    // 創建更多的 ROP gadgets
-    int gadgets_written = 0;
+    // 創建非常明顯的ROP gadget模式
+    // 連續的 pop + ret 組合
     for (int i = 0; i < 100; i++) {
-        // pop + ret 組合
-        chain_ptr[i * 8] = 0x5B;     // pop ebx
-        chain_ptr[i * 8 + 1] = 0xC3; // ret
-        chain_ptr[i * 8 + 2] = 0x5A; // pop edx
-        chain_ptr[i * 8 + 3] = 0xC3; // ret
-        chain_ptr[i * 8 + 4] = 0x59; // pop ecx
-        chain_ptr[i * 8 + 5] = 0xC3; // ret
-        chain_ptr[i * 8 + 6] = 0x58; // pop eax
-        chain_ptr[i * 8 + 7] = 0xC3; // ret
+        // pop eax; ret
+        ptr[offset++] = 0x58;
+        ptr[offset++] = 0xC3;
+        
+        // pop ebx; ret
+        ptr[offset++] = 0x5B;
+        ptr[offset++] = 0xC3;
+        
+        // pop ecx; ret
+        ptr[offset++] = 0x59;
+        ptr[offset++] = 0xC3;
+        
+        // pop edx; ret
+        ptr[offset++] = 0x5A;
+        ptr[offset++] = 0xC3;
     }
-
-    // 驗證寫入的內容
-    int ret_count = 0;
-    for (int i = 0; i < 800; i++) {
-        if (chain_ptr[i] == 0xC3) {
-            ret_count++;
-        }
+    
+    // 創建連續的ret指令（ret sled）
+    for (int i = 0; i < 50; i++) {
+        ptr[offset++] = 0xC3; // ret
     }
-
-    ss.str("");
-    ss << "Written " << gadgets_written << " gadgets with " << ret_count << " ret instructions";
+    
+    // 確保記憶體真的被寫入
+    FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
+    
+    // 確保記憶體內容已經完全寫入
+    FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息，包括基址和實際特徵位址
+    std::stringstream ss;
+    ss << "Created ROP gadgets at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss << " (size: " << std::dec << offset << " bytes, protection: PAGE_EXECUTE_READWRITE)";
     log_message("DEBUG", ss.str().c_str());
     
-    // 創建一個假的堆疊，包含指向我們gadgets的地址
-    uint64_t fake_stack[10];
-    fake_stack[0] = (uint64_t)chain_ptr;        // 指向第一個gadget
-    fake_stack[1] = (uint64_t)(chain_ptr + 8);  // 指向第二個gadget
-    fake_stack[2] = (uint64_t)(chain_ptr + 16); // 指向第三個gadget
-    fake_stack[3] = 0x4141414141414141;         // 假的返回地址
-    fake_stack[4] = 0x4242424242424242;         // 假的返回地址
+    // 輸出實際的ROP特徵位址範圍
+    std::stringstream ss2;
+    ss2 << "ROP pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss2 << ", End: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + offset);
+    ss2 << ", PID: " << std::dec << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
     
-    // 將假的堆疊寫入記憶體
-    memcpy(chain_ptr + 800, fake_stack, sizeof(fake_stack));
+    // 輸出關鍵特徵位址（例如第一個pop+ret的位置）
+    std::stringstream ss3;
+    ss3 << "First ROP gadget at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss3 << " (pop eax; ret)";
+    log_message("DEBUG", ss3.str().c_str());
     
-    // 保持記憶體分配，不立即釋放
-    // 這樣檢測引擎有時間掃描到這些模式
+    // 保持記憶體更長時間
     static std::vector<LPVOID> rop_blocks;
     rop_blocks.push_back(exec_mem);
-
-    // 驗證記憶體是否可訪問
-    if (verify_memory_content(exec_mem, 8192)) {
-        log_message("DEBUG", "Memory content verified - accessible");
-    } else {
-        log_message("ERROR", "Memory content NOT accessible!");
-    }
-
-    ss.str("");
-    ss << "Current ROP blocks in memory: " << rop_blocks.size();
-    log_message("DEBUG", ss.str().c_str());
     
-    // 限制保持的記憶體塊數量，避免記憶體洩漏
-    if (rop_blocks.size() > 5) {
-        VirtualFree(rop_blocks[0], 0, MEM_RELEASE);
-        rop_blocks.erase(rop_blocks.begin());
-    }
+    // 等待一段時間讓檢測引擎有機會掃描
+    std::this_thread::sleep_for(std::chrono::seconds(5));
     
     g_rop_attacks++;
     g_total_attacks++;
-    
-    log_message("SUCCESS", "ROP attack simulation completed");
 }
+
 
 // 緩衝區溢出攻擊模擬
 void simulate_buffer_overflow() {
@@ -163,8 +187,8 @@ void simulate_buffer_overflow() {
 void simulate_heap_corruption() {
     log_message("ATTACK", "Starting heap corruption attack simulation");
     
-    // 分配記憶體並寫入破壞模式
-    void* ptr = malloc(1024);
+    // 使用 VirtualAlloc 分配記憶體，更容易被檢測引擎發現
+    LPVOID ptr = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!ptr) {
         log_message("ERROR", "Failed to allocate memory for heap corruption");
         return;
@@ -172,24 +196,45 @@ void simulate_heap_corruption() {
     
     // 寫入常見的堆積破壞模式
     uint32_t* heap_ptr = (uint32_t*)ptr;
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 1024; i++) {
         heap_ptr[i] = 0xDEADBEEF; // 常見的堆積破壞模式
     }
     
     // 寫入更多破壞模式
-    uint32_t* heap_ptr2 = (uint32_t*)((char*)ptr + 512);
-    for (int i = 0; i < 128; i++) {
+    uint32_t* heap_ptr2 = (uint32_t*)((char*)ptr + 2048);
+    for (int i = 0; i < 512; i++) {
         heap_ptr2[i] = 0xBAADF00D; // 另一個常見的堆積破壞模式
     }
     
+    // 寫入額外的破壞模式
+    uint32_t* heap_ptr3 = (uint32_t*)((char*)ptr + 3072);
+    for (int i = 0; i < 256; i++) {
+        heap_ptr3[i] = 0xFEEEFEEE; // 額外的破壞模式
+    }
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息
+    std::stringstream ss;
+    ss << "Created heap corruption patterns at address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ptr;
+    ss << " (size: 4096 bytes, protection: PAGE_READWRITE)";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 額外輸出記憶體區域資訊，幫助檢測引擎識別
+    std::stringstream ss2;
+    ss2 << "Memory region details - Base: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ptr;
+    ss2 << ", Size: 4096 bytes, PID: " << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
+    
     // 保持記憶體分配，不立即釋放
     // 這樣檢測引擎有時間掃描到這些模式
-    static std::vector<void*> corrupted_blocks;
+    static std::vector<LPVOID> corrupted_blocks;
     corrupted_blocks.push_back(ptr);
     
     // 限制保持的記憶體塊數量，避免記憶體洩漏
     if (corrupted_blocks.size() > 10) {
-        free(corrupted_blocks[0]);
+        VirtualFree(corrupted_blocks[0], 0, MEM_RELEASE);
         corrupted_blocks.erase(corrupted_blocks.begin());
     }
     
@@ -230,6 +275,37 @@ void simulate_shellcode_injection() {
     
     // 將shellcode寫入可執行記憶體
     memcpy(exec_mem, shellcode, sizeof(shellcode));
+    
+    // 確保記憶體內容已經完全寫入
+    FlushInstructionCache(GetCurrentProcess(), exec_mem, sizeof(shellcode));
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息，包括基址和實際特徵位址
+    std::stringstream ss;
+    ss << "Created shellcode at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss << " (size: " << std::dec << sizeof(shellcode) << " bytes, protection: PAGE_EXECUTE_READWRITE)";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 輸出實際的shellcode特徵位址範圍
+    std::stringstream ss2;
+    ss2 << "Shellcode pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss2 << ", End: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + sizeof(shellcode));
+    ss2 << ", PID: " << std::dec << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
+    
+    // 輸出關鍵特徵位址
+    std::stringstream ss3;
+    ss3 << "NOP sled starts at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss3 << " (256 bytes)";
+    log_message("DEBUG", ss3.str().c_str());
+    
+    // 輸出實際shellcode位址
+    std::stringstream ss4;
+    ss4 << "Actual shellcode at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + 384);
+    ss4 << " (xor eax, eax; ret)";
+    log_message("DEBUG", ss4.str().c_str());
     
     // 保持記憶體分配，不立即釋放
     // 這樣檢測引擎有時間掃描到這些模式
@@ -273,6 +349,238 @@ void simulate_use_after_free() {
     log_message("SUCCESS", "Use-After-Free attack simulation completed");
 }
 
+// 新增：ROP + Shellcode組合攻擊模擬
+void simulate_rop_with_shellcode() {
+    log_message("ATTACK", "Starting ROP + Shellcode combination attack simulation");
+    
+    // 創建一個大的可執行記憶體區域
+    LPVOID exec_mem = VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!exec_mem) {
+        log_message("ERROR", "Failed to allocate executable memory");
+        return;
+    }
+    
+    uint8_t* ptr = (uint8_t*)exec_mem;
+    int offset = 0;
+    
+    // 第一部分：ROP gadgets
+    // 連續的 pop + ret 組合
+    for (int i = 0; i < 50; i++) {
+        // pop eax; ret
+        ptr[offset++] = 0x58;
+        ptr[offset++] = 0xC3;
+        
+        // pop ebx; ret
+        ptr[offset++] = 0x5B;
+        ptr[offset++] = 0xC3;
+        
+        // pop ecx; ret
+        ptr[offset++] = 0x59;
+        ptr[offset++] = 0xC3;
+        
+        // pop edx; ret
+        ptr[offset++] = 0x5A;
+        ptr[offset++] = 0xC3;
+    }
+    
+    // 第二部分：Shellcode payload
+    // NOP sled
+    for (int i = 0; i < 128; i++) {
+        ptr[offset++] = 0x90; // NOP
+    }
+    
+    // int3 sled
+    for (int i = 0; i < 64; i++) {
+        ptr[offset++] = 0xCC; // int3
+    }
+    
+    // 簡單的shellcode（返回0）
+    ptr[offset++] = 0x31; // xor eax, eax
+    ptr[offset++] = 0xC0; // xor eax, eax
+    ptr[offset++] = 0xC3; // ret
+    
+    // 保持記憶體分配
+    static std::vector<LPVOID> rop_shellcode_blocks;
+    rop_shellcode_blocks.push_back(exec_mem);
+    
+    if (rop_shellcode_blocks.size() > 3) {
+        VirtualFree(rop_shellcode_blocks[0], 0, MEM_RELEASE);
+        rop_shellcode_blocks.erase(rop_shellcode_blocks.begin());
+    }
+    
+    g_rop_attacks++;
+    g_shellcode_attacks++;
+    g_total_attacks += 2;
+
+    // 確保記憶體內容已經完全寫入
+    FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息，包括基址和實際特徵位址
+    std::stringstream ss;
+    ss << "Created ROP + Shellcode combination at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss << " (size: " << std::dec << offset << " bytes, protection: PAGE_EXECUTE_READWRITE)";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 輸出實際的攻擊特徵位址範圍
+    std::stringstream ss2;
+    ss2 << "Attack pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss2 << ", End: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + offset);
+    ss2 << ", PID: " << std::dec << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
+    
+    // 輸出關鍵特徵位址
+    std::stringstream ss3;
+    ss3 << "First ROP gadget at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss3 << " (pop eax; ret)";
+    log_message("DEBUG", ss3.str().c_str());
+    
+    // 輸出shellcode起始位址
+    std::stringstream ss4;
+    ss4 << "Shellcode starts at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + 400); // 400 = 50*8 (ROP gadgets)
+    ss4 << " (NOP sled)";
+    log_message("DEBUG", ss4.str().c_str());
+    
+    log_message("SUCCESS", "ROP + Shellcode combination attack simulation completed");
+}
+
+// 新增：Heap Corruption + Shellcode組合攻擊模擬
+void simulate_heap_corruption_with_shellcode() {
+    log_message("ATTACK", "Starting Heap Corruption + Shellcode combination attack simulation");
+    
+    // 分配記憶體
+    LPVOID heap_mem = VirtualAlloc(NULL, 8192, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!heap_mem) {
+        log_message("ERROR", "Failed to allocate memory for heap corruption");
+        return;
+    }
+    
+    uint32_t* heap_ptr = (uint32_t*)heap_mem;
+    
+    // 第一部分：Heap corruption patterns
+    for (int i = 0; i < 1024; i++) {
+        heap_ptr[i] = 0xDEADBEEF; // 常見的堆積破壞模式
+    }
+    
+    // 第二部分：Shellcode payload
+    uint8_t* shellcode_ptr = (uint8_t*)(heap_ptr + 1024);
+    
+    // NOP sled
+    for (int i = 0; i < 64; i++) {
+        shellcode_ptr[i] = 0x90; // NOP
+    }
+    
+    // int3 sled
+    for (int i = 64; i < 96; i++) {
+        shellcode_ptr[i] = 0xCC; // int3
+    }
+    
+    // 簡單的shellcode
+    shellcode_ptr[96] = 0x31; // xor eax, eax
+    shellcode_ptr[97] = 0xC0; // xor eax, eax
+    shellcode_ptr[98] = 0xC3; // ret
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息
+    std::stringstream ss;
+    ss << "Created Heap Corruption + Shellcode combination at address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << heap_mem;
+    ss << " (size: 8192 bytes, protection: PAGE_READWRITE)";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 額外輸出記憶體區域資訊，幫助檢測引擎識別
+    std::stringstream ss2;
+    ss2 << "Memory region details - Base: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << heap_mem;
+    ss2 << ", Size: 8192 bytes, PID: " << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
+    
+    // 保持記憶體分配
+    static std::vector<LPVOID> heap_shellcode_blocks;
+    heap_shellcode_blocks.push_back(heap_mem);
+    
+    if (heap_shellcode_blocks.size() > 3) {
+        VirtualFree(heap_shellcode_blocks[0], 0, MEM_RELEASE);
+        heap_shellcode_blocks.erase(heap_shellcode_blocks.begin());
+    }
+    
+    g_heap_corruption_attacks++;
+    g_shellcode_attacks++;
+    g_total_attacks += 2;
+    
+    log_message("SUCCESS", "Heap Corruption + Shellcode combination attack simulation completed");
+}
+
+// 新增：Buffer Overflow + Shellcode組合攻擊模擬
+void simulate_buffer_overflow_with_shellcode() {
+    log_message("ATTACK", "Starting Buffer Overflow + Shellcode combination attack simulation");
+    
+    // 分配可執行記憶體
+    LPVOID exec_mem = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!exec_mem) {
+        log_message("ERROR", "Failed to allocate executable memory");
+        return;
+    }
+    
+    uint8_t* ptr = (uint8_t*)exec_mem;
+    
+    // 第一部分：Buffer overflow pattern (大量'A'字符)
+    for (int i = 0; i < 1024; i++) {
+        ptr[i] = 'A';
+    }
+    
+    // 第二部分：Shellcode payload
+    // NOP sled
+    for (int i = 1024; i < 1280; i++) {
+        ptr[i] = 0x90; // NOP
+    }
+    
+    // int3 sled
+    for (int i = 1280; i < 1344; i++) {
+        ptr[i] = 0xCC; // int3
+    }
+    
+    // 簡單的shellcode
+    ptr[1344] = 0x31; // xor eax, eax
+    ptr[1345] = 0xC0; // xor eax, eax
+    ptr[1346] = 0xC3; // ret
+    
+    // 確保記憶體內容已經完全寫入
+    FlushInstructionCache(GetCurrentProcess(), exec_mem, 4096);
+    
+    // 等待一小段時間讓記憶體佈局穩定
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    // 輸出詳細的調試信息
+    std::stringstream ss;
+    ss << "Created Buffer Overflow + Shellcode combination at address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss << " (size: 4096 bytes, protection: PAGE_EXECUTE_READWRITE)";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 額外輸出記憶體區域資訊，幫助檢測引擎識別
+    std::stringstream ss2;
+    ss2 << "Memory region details - Base: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss2 << ", Size: 4096 bytes, PID: " << GetCurrentProcessId();
+    log_message("INFO", ss2.str().c_str());
+    
+    // 保持記憶體分配
+    static std::vector<LPVOID> buffer_shellcode_blocks;
+    buffer_shellcode_blocks.push_back(exec_mem);
+    
+    if (buffer_shellcode_blocks.size() > 3) {
+        VirtualFree(buffer_shellcode_blocks[0], 0, MEM_RELEASE);
+        buffer_shellcode_blocks.erase(buffer_shellcode_blocks.begin());
+    }
+    
+    g_buffer_overflow_attacks++;
+    g_shellcode_attacks++;
+    g_total_attacks += 2;
+    
+    log_message("SUCCESS", "Buffer Overflow + Shellcode combination attack simulation completed");
+}
+
 // 顯示狀態
 void show_status() {
     std::cout << "\n=== Attack Simulator Status ===\n";
@@ -289,7 +597,7 @@ void show_status() {
 void attack_loop() {
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1, 5);
+    std::uniform_int_distribution<> dis(1, 6); // 改為1-6，移除獨立shellcode
     
     int attack_count = 0;
     while (g_running) {
@@ -306,10 +614,13 @@ void attack_loop() {
                 simulate_heap_corruption();
                 break;
             case 4:
-                simulate_shellcode_injection();
+                simulate_use_after_free();
                 break;
             case 5:
-                simulate_use_after_free();
+                simulate_rop_with_shellcode();
+                break;
+            case 6:
+                simulate_heap_corruption_with_shellcode();
                 break;
         }
         
@@ -362,17 +673,21 @@ int main() {
     std::cout << "1. ROP Attack" << std::endl;
     std::cout << "2. Buffer Overflow Attack" << std::endl;
     std::cout << "3. Heap Corruption Attack" << std::endl;
-    std::cout << "4. Shellcode Injection Attack" << std::endl;
-    std::cout << "5. Use-After-Free Attack" << std::endl;
+    std::cout << "4. Use-After-Free Attack" << std::endl;
+    std::cout << "5. ROP + Shellcode Combination" << std::endl;
+    std::cout << "6. Heap Corruption + Shellcode Combination" << std::endl;
     std::cout << "0. Exit" << std::endl;
-    std::cout << "Enter attack number (0-5): ";
+    std::cout << "Enter attack number (0-6): ";
     
     // 初始化日誌檔案
     g_log_file.open("simple_attack_simulator.log", std::ios::app);
     
+    // 註冊模擬器標記
+    register_simulator_flag();
+
     int choice;
     while (true) {
-        std::cout << "\nEnter attack number (0-5): ";
+        std::cout << "\nEnter attack number (0-6): ";
         std::cin >> choice;
         
         switch (choice) {
@@ -392,13 +707,16 @@ int main() {
                 simulate_heap_corruption();
                 break;
             case 4:
-                simulate_shellcode_injection();
-                break;
-            case 5:
                 simulate_use_after_free();
                 break;
+            case 5:
+                simulate_rop_with_shellcode();
+                break;
+            case 6:
+                simulate_heap_corruption_with_shellcode();
+                break;
             default:
-                std::cout << "Invalid choice. Please enter 0-5." << std::endl;
+                std::cout << "Invalid choice. Please enter 0-6." << std::endl;
                 break;
         }
         

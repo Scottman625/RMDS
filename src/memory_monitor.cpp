@@ -549,7 +549,7 @@ std::string MemoryMonitor::get_timestamp() const {
 
 std::string MemoryMonitor::format_address(uint64_t address) const {
     std::stringstream ss;
-    ss << "0x" << std::hex << std::uppercase << address;
+    ss << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << address;
     return ss.str();
 }
 
