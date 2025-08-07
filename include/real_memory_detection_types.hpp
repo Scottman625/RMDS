@@ -21,7 +21,9 @@ enum class AttackType {
     DOUBLE_FREE,            // 重複釋放
     SHELLCODE_INJECTION,    // Shellcode 注入
     API_HOOK,               // API Hook
-    MEMORY_CORRUPTION       // 記憶體破壞
+    MEMORY_CORRUPTION,      // 記憶體破壞
+    COMPLEX_ATTACK,         // 複雜攻擊鏈
+    SUSPICIOUS_BEHAVIOR     // 可疑行為模式
 };
 
 /**

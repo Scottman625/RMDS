@@ -12,6 +12,10 @@
 #include <io.h>
 #include <conio.h>
 #include <vector> // Added for corrupted_blocks
+#include <cstring> // Added for memset
+#include <cstdint> // Added for uintptr_t
+#include <algorithm> // Added for std::accumulate
+#include <numeric> // Added for std::accumulate
 
 // 模擬器標記常量
 constexpr DWORD SIMULATOR_MAGIC = 0x53494D55; // 'SIMU'
@@ -78,12 +82,15 @@ void log_message(const char* level, const char* message) {
     std::cout << log_entry;
 }
 
-// 在 simulate_rop_attack() 中添加更明顯的ROP特徵
-void simulate_rop_attack() {
-    log_message("ATTACK", "Starting enhanced ROP attack simulation");
+// 統一的增強型ROP攻擊模擬器（整合了原來的兩個函數）
+void simulate_rop_attack(bool include_shellcode = false) {
+    std::string attack_type = include_shellcode ? "ROP + Shellcode combination" : "ROP";
+    std::string attack_msg = "Starting enhanced " + attack_type + " attack simulation";
+    log_message("ATTACK", attack_msg.c_str());
     
-    // 創建一個大的ROP gadget區域
-    LPVOID exec_mem = VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    // 根據是否包含shellcode調整記憶體大小
+    size_t mem_size = include_shellcode ? 32768 : 24576;
+    LPVOID exec_mem = VirtualAlloc(NULL, mem_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!exec_mem) {
         log_message("ERROR", "Failed to allocate executable memory");
         return;
@@ -92,9 +99,9 @@ void simulate_rop_attack() {
     uint8_t* ptr = (uint8_t*)exec_mem;
     int offset = 0;
     
-    // 創建非常明顯的ROP gadget模式
-    // 連續的 pop + ret 組合
-    for (int i = 0; i < 100; i++) {
+    // 第一階段：創建基礎ROP gadgets（更真實的數量）
+    int gadget_count = include_shellcode ? 15 : 25;
+    for (int i = 0; i < gadget_count; i++) {
         // pop eax; ret
         ptr[offset++] = 0x58;
         ptr[offset++] = 0xC3;
@@ -110,50 +117,194 @@ void simulate_rop_attack() {
         // pop edx; ret
         ptr[offset++] = 0x5A;
         ptr[offset++] = 0xC3;
+        
+        // pop esi; ret
+        ptr[offset++] = 0x5E;
+        ptr[offset++] = 0xC3;
+        
+        // pop edi; ret
+        ptr[offset++] = 0x5F;
+        ptr[offset++] = 0xC3;
     }
     
-    // 創建連續的ret指令（ret sled）
-    for (int i = 0; i < 50; i++) {
+    // 第二階段：創建連續的ret指令（ret sled）
+    int ret_sled_count = include_shellcode ? 8 : 15;
+    for (int i = 0; i < ret_sled_count; i++) {
         ptr[offset++] = 0xC3; // ret
     }
     
-    // 確保記憶體真的被寫入
-    FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
+    // 第三階段：創建複雜的ROP鏈模式
+    int complex_gadget_count = include_shellcode ? 8 : 12;
+    for (int i = 0; i < complex_gadget_count; i++) {
+        // 模擬 stack pivot gadgets
+        // xchg eax, esp; ret
+        ptr[offset++] = 0x94;
+        ptr[offset++] = 0xC3;
+        
+        // add esp, 4; ret
+        ptr[offset++] = 0x83;
+        ptr[offset++] = 0xC4;
+        ptr[offset++] = 0x04;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬函數調用gadgets
+        // call [eax]
+        ptr[offset++] = 0xFF;
+        ptr[offset++] = 0x10;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬算術運算gadgets
+        // add eax, 4; ret
+        ptr[offset++] = 0x83;
+        ptr[offset++] = 0xC0;
+        ptr[offset++] = 0x04;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬條件跳轉gadgets
+        // test eax, eax; jnz +2; ret
+        ptr[offset++] = 0x85;
+        ptr[offset++] = 0xC0;
+        ptr[offset++] = 0x75;
+        ptr[offset++] = 0x02;
+        ptr[offset++] = 0xC3;
+    }
     
+    // 第四階段：創建高密度的RET指令區域（模擬ROP鏈的核心）
+    int high_density_ret_count = include_shellcode ? 12 : 20;
+    for (int i = 0; i < high_density_ret_count; i++) {
+        ptr[offset++] = 0xC3; // ret
+    }
+    
+    // 第五階段：創建混合的gadget模式（更真實的ROP鏈）
+    int mixed_gadget_count = include_shellcode ? 10 : 18;
+    for (int i = 0; i < mixed_gadget_count; i++) {
+        // 模擬 mov gadgets
+        // mov eax, [esp]; ret
+        ptr[offset++] = 0x8B;
+        ptr[offset++] = 0x04;
+        ptr[offset++] = 0x24;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬 push gadgets
+        // push eax; ret
+        ptr[offset++] = 0x50;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬 pop gadgets
+        // pop eax; ret
+        ptr[offset++] = 0x58;
+        ptr[offset++] = 0xC3;
+        
+        // 模擬 lea gadgets
+        // lea eax, [esp+4]; ret
+        ptr[offset++] = 0x8D;
+        ptr[offset++] = 0x44;
+        ptr[offset++] = 0x24;
+        ptr[offset++] = 0x04;
+        ptr[offset++] = 0xC3;
+    }
+    
+    // 第六階段：創建最終的連續RET序列（確保檢測觸發）
+    int final_ret_count = include_shellcode ? 8 : 15;
+    for (int i = 0; i < final_ret_count; i++) {
+        ptr[offset++] = 0xC3; // ret
+    }
+    
+    // 如果包含shellcode，添加shellcode payload
+    if (include_shellcode) {
+        // NOP sled
+        for (int i = 0; i < 256; i++) {
+            ptr[offset++] = 0x90; // NOP
+        }
+        
+        // int3 sled
+        for (int i = 0; i < 128; i++) {
+            ptr[offset++] = 0xCC; // int3
+        }
+        
+        // 更複雜的shellcode
+        // xor eax, eax
+        ptr[offset++] = 0x31;
+        ptr[offset++] = 0xC0;
+        
+        // mov ebx, 0x12345678
+        ptr[offset++] = 0xBB;
+        ptr[offset++] = 0x78;
+        ptr[offset++] = 0x56;
+        ptr[offset++] = 0x34;
+        ptr[offset++] = 0x12;
+        
+        // add eax, ebx
+        ptr[offset++] = 0x01;
+        ptr[offset++] = 0xD8;
+        
+        // ret
+        ptr[offset++] = 0xC3;
+    }
+    
+    // 保持記憶體分配
+    static std::vector<LPVOID> rop_blocks;
+    rop_blocks.push_back(exec_mem);
+    
+    if (rop_blocks.size() > 3) {
+        VirtualFree(rop_blocks[0], 0, MEM_RELEASE);
+        rop_blocks.erase(rop_blocks.begin());
+    }
+    
+    g_rop_attacks++;
+    if (include_shellcode) {
+        g_shellcode_attacks++;
+        g_total_attacks += 2;
+    } else {
+        g_total_attacks++;
+    }
+
     // 確保記憶體內容已經完全寫入
     FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
     
     // 等待一小段時間讓記憶體佈局穩定
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
-    // 輸出詳細的調試信息，包括基址和實際特徵位址
+    // 輸出詳細的調試信息
     std::stringstream ss;
-    ss << "Created ROP gadgets at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss << "Created enhanced " << attack_type << " at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
     ss << " (size: " << std::dec << offset << " bytes, protection: PAGE_EXECUTE_READWRITE)";
     log_message("DEBUG", ss.str().c_str());
     
-    // 輸出實際的ROP特徵位址範圍
+    // 輸出實際的攻擊特徵位址範圍
     std::stringstream ss2;
-    ss2 << "ROP pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
+    ss2 << "Enhanced attack pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
     ss2 << ", End: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + offset);
     ss2 << ", PID: " << std::dec << GetCurrentProcessId();
     log_message("INFO", ss2.str().c_str());
     
-    // 輸出關鍵特徵位址（例如第一個pop+ret的位置）
+    // 輸出關鍵特徵位址
     std::stringstream ss3;
     ss3 << "First ROP gadget at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
     ss3 << " (pop eax; ret)";
     log_message("DEBUG", ss3.str().c_str());
     
-    // 保持記憶體更長時間
-    static std::vector<LPVOID> rop_blocks;
-    rop_blocks.push_back(exec_mem);
+    if (include_shellcode) {
+        // 輸出shellcode起始位址
+        int shellcode_offset = gadget_count * 12 + ret_sled_count + complex_gadget_count * 12 + high_density_ret_count + mixed_gadget_count * 12 + final_ret_count;
+        std::stringstream ss4;
+        ss4 << "Shellcode starts at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + shellcode_offset);
+        ss4 << " (NOP sled)";
+        log_message("DEBUG", ss4.str().c_str());
+    }
     
-    // 等待一段時間讓檢測引擎有機會掃描
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // 輸出統計信息
+    std::stringstream ss5;
+    ss5 << "Enhanced " << attack_type << " statistics - Total gadgets: " << std::dec << (gadget_count * 6 + complex_gadget_count * 5 + mixed_gadget_count * 4);
+    ss5 << ", Consecutive RETs: " << std::dec << (ret_sled_count + high_density_ret_count + final_ret_count);
+    if (include_shellcode) {
+        ss5 << ", Shellcode size: " << std::dec << (256 + 128 + 8);
+    }
+    ss5 << ", Total size: " << std::dec << offset << " bytes";
+    log_message("INFO", ss5.str().c_str());
     
-    g_rop_attacks++;
-    g_total_attacks++;
+    std::string success_msg = "Enhanced " + attack_type + " attack simulation completed";
+    log_message("SUCCESS", success_msg.c_str());
 }
 
 
@@ -349,103 +500,6 @@ void simulate_use_after_free() {
     log_message("SUCCESS", "Use-After-Free attack simulation completed");
 }
 
-// 新增：ROP + Shellcode組合攻擊模擬
-void simulate_rop_with_shellcode() {
-    log_message("ATTACK", "Starting ROP + Shellcode combination attack simulation");
-    
-    // 創建一個大的可執行記憶體區域
-    LPVOID exec_mem = VirtualAlloc(NULL, 16384, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!exec_mem) {
-        log_message("ERROR", "Failed to allocate executable memory");
-        return;
-    }
-    
-    uint8_t* ptr = (uint8_t*)exec_mem;
-    int offset = 0;
-    
-    // 第一部分：ROP gadgets
-    // 連續的 pop + ret 組合
-    for (int i = 0; i < 50; i++) {
-        // pop eax; ret
-        ptr[offset++] = 0x58;
-        ptr[offset++] = 0xC3;
-        
-        // pop ebx; ret
-        ptr[offset++] = 0x5B;
-        ptr[offset++] = 0xC3;
-        
-        // pop ecx; ret
-        ptr[offset++] = 0x59;
-        ptr[offset++] = 0xC3;
-        
-        // pop edx; ret
-        ptr[offset++] = 0x5A;
-        ptr[offset++] = 0xC3;
-    }
-    
-    // 第二部分：Shellcode payload
-    // NOP sled
-    for (int i = 0; i < 128; i++) {
-        ptr[offset++] = 0x90; // NOP
-    }
-    
-    // int3 sled
-    for (int i = 0; i < 64; i++) {
-        ptr[offset++] = 0xCC; // int3
-    }
-    
-    // 簡單的shellcode（返回0）
-    ptr[offset++] = 0x31; // xor eax, eax
-    ptr[offset++] = 0xC0; // xor eax, eax
-    ptr[offset++] = 0xC3; // ret
-    
-    // 保持記憶體分配
-    static std::vector<LPVOID> rop_shellcode_blocks;
-    rop_shellcode_blocks.push_back(exec_mem);
-    
-    if (rop_shellcode_blocks.size() > 3) {
-        VirtualFree(rop_shellcode_blocks[0], 0, MEM_RELEASE);
-        rop_shellcode_blocks.erase(rop_shellcode_blocks.begin());
-    }
-    
-    g_rop_attacks++;
-    g_shellcode_attacks++;
-    g_total_attacks += 2;
-
-    // 確保記憶體內容已經完全寫入
-    FlushInstructionCache(GetCurrentProcess(), exec_mem, offset);
-    
-    // 等待一小段時間讓記憶體佈局穩定
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
-    // 輸出詳細的調試信息，包括基址和實際特徵位址
-    std::stringstream ss;
-    ss << "Created ROP + Shellcode combination at base address: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
-    ss << " (size: " << std::dec << offset << " bytes, protection: PAGE_EXECUTE_READWRITE)";
-    log_message("DEBUG", ss.str().c_str());
-    
-    // 輸出實際的攻擊特徵位址範圍
-    std::stringstream ss2;
-    ss2 << "Attack pattern addresses - Start: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
-    ss2 << ", End: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + offset);
-    ss2 << ", PID: " << std::dec << GetCurrentProcessId();
-    log_message("INFO", ss2.str().c_str());
-    
-    // 輸出關鍵特徵位址
-    std::stringstream ss3;
-    ss3 << "First ROP gadget at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << exec_mem;
-    ss3 << " (pop eax; ret)";
-    log_message("DEBUG", ss3.str().c_str());
-    
-    // 輸出shellcode起始位址
-    std::stringstream ss4;
-    ss4 << "Shellcode starts at: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << ((uintptr_t)exec_mem + 400); // 400 = 50*8 (ROP gadgets)
-    ss4 << " (NOP sled)";
-    log_message("DEBUG", ss4.str().c_str());
-    
-    log_message("SUCCESS", "ROP + Shellcode combination attack simulation completed");
-}
-
 // 新增：Heap Corruption + Shellcode組合攻擊模擬
 void simulate_heap_corruption_with_shellcode() {
     log_message("ATTACK", "Starting Heap Corruption + Shellcode combination attack simulation");
@@ -581,6 +635,225 @@ void simulate_buffer_overflow_with_shellcode() {
     log_message("SUCCESS", "Buffer Overflow + Shellcode combination attack simulation completed");
 }
 
+// 新增：分散式ROP攻擊模擬器（更符合真實情況）
+void simulate_scattered_rop_attack(bool include_shellcode = false) {
+    std::string attack_type = include_shellcode ? "Scattered ROP + Shellcode" : "Scattered ROP";
+    std::string attack_msg = "Starting realistic " + attack_type + " attack simulation";
+    log_message("ATTACK", attack_msg.c_str());
+    
+    // 創建多個分散的記憶體區域來模擬真實的ROP攻擊
+    std::vector<LPVOID> gadget_regions;
+    std::vector<size_t> region_sizes;
+    
+    // 第一區域：基礎POP gadgets
+    LPVOID pop_region = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (pop_region) {
+        gadget_regions.push_back(pop_region);
+        region_sizes.push_back(4096);
+        
+        uint8_t* ptr = (uint8_t*)pop_region;
+        int offset = 0;
+        
+        // 創建POP gadgets，分散在不同位置
+        for (int i = 0; i < 50; i++) {
+            // 在隨機位置插入POP gadgets
+            int pos = (i * 64) % 4000; // 分散分佈
+            if (pos + 2 < 4096) {
+                ptr[pos] = 0x58 + (i % 8); // pop r32
+                ptr[pos + 1] = 0xC3; // ret
+            }
+        }
+        
+        FlushInstructionCache(GetCurrentProcess(), pop_region, 4096);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // 第二區域：Stack pivot gadgets
+    LPVOID pivot_region = VirtualAlloc(NULL, 2048, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (pivot_region) {
+        gadget_regions.push_back(pivot_region);
+        region_sizes.push_back(2048);
+        
+        uint8_t* ptr = (uint8_t*)pivot_region;
+        
+        // xchg eax, esp; ret
+        ptr[0] = 0x94;
+        ptr[1] = 0xC3;
+        
+        // add esp, 4; ret
+        ptr[64] = 0x83;
+        ptr[65] = 0xC4;
+        ptr[66] = 0x04;
+        ptr[67] = 0xC3;
+        
+        // add esp, 8; ret
+        ptr[128] = 0x83;
+        ptr[129] = 0xC4;
+        ptr[130] = 0x08;
+        ptr[131] = 0xC3;
+        
+        FlushInstructionCache(GetCurrentProcess(), pivot_region, 2048);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // 第三區域：算術運算gadgets
+    LPVOID arithmetic_region = VirtualAlloc(NULL, 3072, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (arithmetic_region) {
+        gadget_regions.push_back(arithmetic_region);
+        region_sizes.push_back(3072);
+        
+        uint8_t* ptr = (uint8_t*)arithmetic_region;
+        
+        // add eax, 4; ret
+        ptr[0] = 0x83;
+        ptr[1] = 0xC0;
+        ptr[2] = 0x04;
+        ptr[3] = 0xC3;
+        
+        // add ebx, 4; ret
+        ptr[64] = 0x83;
+        ptr[65] = 0xC3;
+        ptr[66] = 0x04;
+        ptr[67] = 0xC3;
+        
+        // sub eax, 4; ret
+        ptr[128] = 0x83;
+        ptr[129] = 0xE8;
+        ptr[130] = 0x04;
+        ptr[131] = 0xC3;
+        
+        FlushInstructionCache(GetCurrentProcess(), arithmetic_region, 3072);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // 第四區域：MOV gadgets
+    LPVOID mov_region = VirtualAlloc(NULL, 2048, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (mov_region) {
+        gadget_regions.push_back(mov_region);
+        region_sizes.push_back(2048);
+        
+        uint8_t* ptr = (uint8_t*)mov_region;
+        
+        // mov eax, [esp]; ret
+        ptr[0] = 0x8B;
+        ptr[1] = 0x04;
+        ptr[2] = 0x24;
+        ptr[3] = 0xC3;
+        
+        // mov ebx, [esp+4]; ret
+        ptr[64] = 0x8B;
+        ptr[65] = 0x5C;
+        ptr[66] = 0x24;
+        ptr[67] = 0x04;
+        ptr[68] = 0xC3;
+        
+        FlushInstructionCache(GetCurrentProcess(), mov_region, 2048);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // 第五區域：RET sled（用於ROP鏈跳轉）
+    LPVOID ret_sled_region = VirtualAlloc(NULL, 1024, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (ret_sled_region) {
+        gadget_regions.push_back(ret_sled_region);
+        region_sizes.push_back(1024);
+        
+        uint8_t* ptr = (uint8_t*)ret_sled_region;
+        
+        // 創建RET sled
+        for (int i = 0; i < 256; i++) {
+            ptr[i] = 0xC3; // ret
+        }
+        
+        FlushInstructionCache(GetCurrentProcess(), ret_sled_region, 1024);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    
+    // 如果包含shellcode，創建shellcode區域
+    if (include_shellcode) {
+        LPVOID shellcode_region = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (shellcode_region) {
+            gadget_regions.push_back(shellcode_region);
+            region_sizes.push_back(4096);
+            
+            uint8_t* ptr = (uint8_t*)shellcode_region;
+            int offset = 0;
+            
+            // NOP sled
+            for (int i = 0; i < 512; i++) {
+                ptr[offset++] = 0x90; // NOP
+            }
+            
+            // 簡單的shellcode
+            // xor eax, eax
+            ptr[offset++] = 0x31;
+            ptr[offset++] = 0xC0;
+            
+            // mov ebx, 0x12345678
+            ptr[offset++] = 0xBB;
+            ptr[offset++] = 0x78;
+            ptr[offset++] = 0x56;
+            ptr[offset++] = 0x34;
+            ptr[offset++] = 0x12;
+            
+            // add eax, ebx
+            ptr[offset++] = 0x01;
+            ptr[offset++] = 0xD8;
+            
+            // ret
+            ptr[offset++] = 0xC3;
+            
+            FlushInstructionCache(GetCurrentProcess(), shellcode_region, 4096);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    
+    // 保持記憶體分配
+    static std::vector<LPVOID> scattered_rop_blocks;
+    for (auto region : gadget_regions) {
+        scattered_rop_blocks.push_back(region);
+    }
+    
+    if (scattered_rop_blocks.size() > 10) {
+        for (int i = 0; i < 5; i++) {
+            VirtualFree(scattered_rop_blocks[0], 0, MEM_RELEASE);
+            scattered_rop_blocks.erase(scattered_rop_blocks.begin());
+        }
+    }
+    
+    g_rop_attacks++;
+    if (include_shellcode) {
+        g_shellcode_attacks++;
+        g_total_attacks += 2;
+    } else {
+        g_total_attacks++;
+    }
+    
+    // 輸出詳細的調試信息
+    std::stringstream ss;
+    ss << "Created realistic " << attack_type << " with " << gadget_regions.size() << " scattered regions";
+    log_message("DEBUG", ss.str().c_str());
+    
+    // 輸出每個區域的地址
+    for (size_t i = 0; i < gadget_regions.size(); i++) {
+        std::stringstream ss2;
+        ss2 << "Region " << (i + 1) << ": Base=0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(16) << gadget_regions[i];
+        ss2 << ", Size=" << std::dec << region_sizes[i] << " bytes";
+        log_message("DEBUG", ss2.str().c_str());
+    }
+    
+    // 輸出統計信息
+    std::stringstream ss3;
+    ss3 << "Scattered ROP statistics - Total regions: " << std::dec << gadget_regions.size();
+    ss3 << ", Total size: " << std::dec << std::accumulate(region_sizes.begin(), region_sizes.end(), 0) << " bytes";
+    if (include_shellcode) {
+        ss3 << ", Includes shellcode payload";
+    }
+    log_message("INFO", ss3.str().c_str());
+    
+    std::string success_msg = "Realistic " + attack_type + " attack simulation completed";
+    log_message("SUCCESS", success_msg.c_str());
+}
+
 // 顯示狀態
 void show_status() {
     std::cout << "\n=== Attack Simulator Status ===\n";
@@ -597,7 +870,7 @@ void show_status() {
 void attack_loop() {
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(1, 6); // 改為1-6，移除獨立shellcode
+    std::uniform_int_distribution<> dis(1, 8); // 改為1-8，添加分散式ROP攻擊
     
     int attack_count = 0;
     while (g_running) {
@@ -617,10 +890,16 @@ void attack_loop() {
                 simulate_use_after_free();
                 break;
             case 5:
-                simulate_rop_with_shellcode();
+                simulate_rop_attack(true); // 使用新的統一函數，包含shellcode
                 break;
             case 6:
                 simulate_heap_corruption_with_shellcode();
+                break;
+            case 7:
+                simulate_scattered_rop_attack(); // 新增：分散式ROP攻擊
+                break;
+            case 8:
+                simulate_scattered_rop_attack(true); // 新增：分散式ROP + Shellcode
                 break;
         }
         
@@ -676,8 +955,10 @@ int main() {
     std::cout << "4. Use-After-Free Attack" << std::endl;
     std::cout << "5. ROP + Shellcode Combination" << std::endl;
     std::cout << "6. Heap Corruption + Shellcode Combination" << std::endl;
+    std::cout << "7. Scattered ROP Attack (Realistic)" << std::endl;
+    std::cout << "8. Scattered ROP + Shellcode (Realistic)" << std::endl;
     std::cout << "0. Exit" << std::endl;
-    std::cout << "Enter attack number (0-6): ";
+    std::cout << "Enter attack number (0-8): ";
     
     // 初始化日誌檔案
     g_log_file.open("simple_attack_simulator.log", std::ios::app);
@@ -687,7 +968,7 @@ int main() {
 
     int choice;
     while (true) {
-        std::cout << "\nEnter attack number (0-6): ";
+        std::cout << "\nEnter attack number (0-8): ";
         std::cin >> choice;
         
         switch (choice) {
@@ -710,13 +991,19 @@ int main() {
                 simulate_use_after_free();
                 break;
             case 5:
-                simulate_rop_with_shellcode();
+                simulate_rop_attack(true); // 使用新的統一函數，包含shellcode
                 break;
             case 6:
                 simulate_heap_corruption_with_shellcode();
                 break;
+            case 7:
+                simulate_scattered_rop_attack(); // 新增：分散式ROP攻擊
+                break;
+            case 8:
+                simulate_scattered_rop_attack(true); // 新增：分散式ROP + Shellcode
+                break;
             default:
-                std::cout << "Invalid choice. Please enter 0-6." << std::endl;
+                std::cout << "Invalid choice. Please enter 0-8." << std::endl;
                 break;
         }
         
