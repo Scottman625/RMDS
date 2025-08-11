@@ -1,4 +1,4 @@
-#include "../include/real_memory_detection_utils.hpp"
+#include "../include/memory_detection_utils.hpp"
 #include <iostream>
 #include <sstream>
 #include <iomanip>

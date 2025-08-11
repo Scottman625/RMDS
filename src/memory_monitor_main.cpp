@@ -1,5 +1,5 @@
-#include "../include/real_memory_detection_monitor.hpp"
-#include "../include/real_memory_detection_types.hpp"
+#include "../include/memory_detection_monitor.hpp"
+#include "../include/memory_detection_types.hpp"
 #include <iostream>
 #include <conio.h>
 #include <thread>
@@ -8,7 +8,7 @@
 using namespace RealMemoryDetection;
 
 // 記憶體違規回調函數
-void on_memory_violation(AttackType type, uint64_t address, const std::string& description, double confidence) {
+void on_memory_violation(AttackType type, uint64_t address, const std::string& description, double confidence, DWORD process_id) {
     std::cout << "\n[警告] 檢測到記憶體違規:\n";
     std::cout << "類型: ";
     
@@ -42,6 +42,7 @@ void on_memory_violation(AttackType type, uint64_t address, const std::string& d
     std::cout << "\n地址: 0x" << std::hex << address << std::dec;
     std::cout << "\n描述: " << description;
     std::cout << "\n置信度: " << confidence;
+    std::cout << "\n進程ID: " << process_id;
     std::cout << "\n" << std::endl;
 }
 

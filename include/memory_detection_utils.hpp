@@ -13,7 +13,7 @@
 #include <mutex>
 #include <sstream>
 #include <iomanip>
-#include "real_memory_detection_types.hpp"
+#include "memory_detection_types.hpp"
 
 namespace RealMemoryDetection {
 

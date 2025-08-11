@@ -5,6 +5,7 @@
 #include <vector>
 #include <Windows.h>
 #include <chrono>
+#include "utils/process_lists.hpp"
 
 namespace RealMemoryDetection {
 
@@ -60,6 +61,10 @@ struct ProcessInfo {
     HANDLE process_handle;
     std::vector<MemoryRegion> memory_regions;
     bool is_suspicious;
+    MemoryDetectionEngine::ProcessCategory category;
+    int priority;
+    std::chrono::steady_clock::time_point last_scan;
+    uint32_t scan_count;
 };
 
 /**

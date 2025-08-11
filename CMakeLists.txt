@@ -32,7 +32,7 @@ include_directories(include)
 add_subdirectory(src)
 
 # 安裝規則
-install(TARGETS real_memory_detection_engine
+install(TARGETS memory_detection_engine real_detection_engine attack_simulator memory_monitor
     EXPORT RealMemoryDetectionEngineTargets
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
