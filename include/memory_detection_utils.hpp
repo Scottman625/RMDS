@@ -73,7 +73,7 @@ private:
     int log_level_;
 
 public:
-    explicit Logger(const std::string& log_file = "detection_engine.log", int level = 1);
+    explicit Logger(const std::string& log_file = "logs/detection_engine.log", int level = 1);
     ~Logger();
     
     void log(const std::string& level, const std::string& message);

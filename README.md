@@ -104,8 +104,8 @@ cmake --build . --config Release
    ```
 
 3. **查看日誌**:
-   - 檢測引擎日誌: `detection_engine.log`
-   - 攻擊模擬器日誌: `attack_simulator.log`
+   - 檢測引擎日誌: `logs/detection_engine.log`
+- 攻擊模擬器日誌: `logs/simple_attack_simulator.log`
 
 ## 使用說明
 

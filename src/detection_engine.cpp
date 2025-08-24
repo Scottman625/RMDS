@@ -933,7 +933,7 @@ private:
         }
         
         // 現代shellcode檢測
-        if (detect_modern_shellcode(buffer, size)) {
+        if (MemoryMonitor::detect_modern_shellcode(buffer, size)) {
             score += 20; // 提高權重
         }
         
@@ -2588,8 +2588,11 @@ public:
     // 重寫基類的 start() 方法
     bool start() override {
         try {
+            // 確保 logs 目錄存在
+            CreateDirectoryA("logs", NULL);
+            
             // 初始化日誌檔案
-            log_file_.open("detection_engine.log", std::ios::app);
+            log_file_.open("logs/detection_engine.log", std::ios::app);
             if (!log_file_.is_open()) {
                 std::cerr << "Failed to open log file" << std::endl;
                 return false;
@@ -2618,7 +2621,7 @@ public:
             config.enable_executable_monitoring = true;
             config.enable_shared_memory_monitoring = true;
             config.suspicious_pattern_threshold = 5;
-            config.log_file = "memory_monitor.log";
+            config.log_file = "logs/memory_monitor.log";
             
             memory_monitor_ = std::make_unique<MemoryMonitor>(config);
             
@@ -4064,8 +4067,11 @@ int main() {
     std::cout << "Monitoring: ROP, JOP, Buffer Overflow, Heap Corruption, Stack Overflow" << std::endl;
     std::cout << "==================================================" << std::endl;
     
+    // 確保 logs 目錄存在
+    CreateDirectoryA("logs", NULL);
+    
     // 初始化日誌檔案
-    std::ofstream log_file("detection_engine.log", std::ios::app);
+    std::ofstream log_file("logs/detection_engine.log", std::ios::app);
     if (log_file.is_open()) {
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);

@@ -59,7 +59,7 @@ int main() {
     config.enable_executable_monitoring = true;
     config.enable_shared_memory_monitoring = true;
     config.suspicious_pattern_threshold = 5;
-    config.log_file = "memory_monitor.log";
+    config.log_file = "logs/memory_monitor.log";
     
     // 創建記憶體監控器
     MemoryMonitor monitor(config);

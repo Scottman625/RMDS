@@ -112,7 +112,7 @@ struct EngineConfig {
     
     // 其他設置
     uint32_t max_detection_results = 1000;
-    std::string log_file = "real_memory_detection.log";
+    std::string log_file = "logs/real_memory_detection.log";
 };
 
 } // namespace RealMemoryDetection 

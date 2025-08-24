@@ -71,7 +71,7 @@ void log_message(const char* level, const char* message) {
     }
     
     // 同時寫入到檢測引擎的log檔案，讓記憶體位址可以在檢測引擎log中找到
-    std::ofstream detection_log("detection_engine.log", std::ios::app);
+    std::ofstream detection_log("logs/detection_engine.log", std::ios::app);
     if (detection_log.is_open()) {
         detection_log << log_entry;
         detection_log.flush();
@@ -893,8 +893,11 @@ int main() {
     std::cout << "0. Exit" << std::endl;
     std::cout << "Enter attack number (0-6): ";
     
+    // 確保 logs 目錄存在
+    CreateDirectoryA("logs", NULL);
+    
     // 初始化日誌檔案
-    g_log_file.open("simple_attack_simulator.log", std::ios::app);
+    g_log_file.open("logs/simple_attack_simulator.log", std::ios::app);
     
     // 註冊模擬器標記
     register_simulator_flag();

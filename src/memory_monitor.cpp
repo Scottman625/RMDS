@@ -11,6 +11,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <windows.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
 
@@ -76,6 +77,9 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     stats_.shellcode_detections = 0;
     stats_.last_scan = std::chrono::system_clock::now();
     stats_.last_detection = std::chrono::system_clock::now();
+    
+    // 確保 logs 目錄存在
+    CreateDirectoryA("logs", NULL);
     
     // 打開日誌檔案
     log_file_.open(config_.log_file, std::ios::app);
@@ -206,13 +210,15 @@ void MemoryMonitor::monitor_process(DWORD process_id, const std::string& process
     // 根據進程類型進行不同深度的掃描
     switch (category) {
         case MemoryDetectionEngine::ProcessCategory::ATTACK_SIMULATOR:
-            deep_scan_process(process_id);
+            // 深度掃描在 DetectionEngineImpl 中實現
+            scan_process_memory(process_id, false);
             break;
         case MemoryDetectionEngine::ProcessCategory::HIGH_RISK_PROCESS:
             {
                 HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
                 if (hProcess) {
-                    smart_scan_process(process_id, hProcess, category);
+                    // 智能掃描在 DetectionEngineImpl 中實現
+                    scan_process_memory(process_id, false);
                     CloseHandle(hProcess);
                 }
             }
@@ -223,13 +229,7 @@ void MemoryMonitor::monitor_process(DWORD process_id, const std::string& process
     }
 }
 
-void MemoryMonitor::deep_scan_process(DWORD process_id) {
-// 在子類中實現
-}
 
-void MemoryMonitor::smart_scan_process(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category) {
-// 在子類中實現
-}
 
 
 void MemoryMonitor::scan_process_memory(DWORD process_id, bool /* is_system_process */) {
@@ -246,8 +246,8 @@ void MemoryMonitor::scan_process_memory(DWORD process_id, bool /* is_system_proc
         std::cout << "    *** Scanning attack simulator memory regions ***" << std::endl;
     }
     
-    // 使用智能掃描
-    smart_scan_process(process_id, hProcess, category);
+    // 基本記憶體掃描
+    // 注意：深度掃描在 DetectionEngineImpl 中實現
     
     if (is_attack_simulator) {
         std::cout << "    *** Smart scan completed for attack simulator ***" << std::endl;
