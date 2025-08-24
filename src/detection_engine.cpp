@@ -1066,7 +1066,7 @@ private:
             try {
                 // 降低掃描頻率 - 每5秒掃描一次
                 scan_memory_for_attacks();
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                std::this_thread::sleep_for(std::chrono::seconds(10));
                 
                 // 每10秒進行一次全進程掃描（原本是60秒）
                 if (cycle_output_counter_ % 3 == 0) {

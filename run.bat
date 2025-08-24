@@ -10,11 +10,7 @@ fltmc >nul 2>&1 || (
 echo ========================================
 powershell -Command "Write-Host '進階記憶體攻擊檢測引擎測試套件'"
 echo ========================================
-echo.
-powershell -Command "Write-Host '本腳本將執行以下防禦繞過操作：'"
-powershell -Command "Write-Host '1. 臨時添加白名單路徑 (持續30分鐘)'"
-powershell -Command "Write-Host '2. 啟用開發者模式標記'"
-powershell -Command "Write-Host '3. 內存指紋混淆技術'"
+
 echo.
 pause
 
