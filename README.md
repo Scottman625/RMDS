@@ -6,32 +6,37 @@
 
 ## 核心特性
 
-- **多種攻擊類型檢測**: ROP、緩衝區溢出、堆損壞、Shellcode注入、Use-After-Free
+- **多種攻擊類型檢測**: ROP、JOP、緩衝區溢出、堆損壞、Shellcode注入、Use-After-Free
 - **實時進程監控**: 動態掃描系統進程，智能優先級排序
 - **內存區域掃描**: 深度掃描進程內存區域，檢測攻擊模式
 - **攻擊模擬器**: 內建攻擊模擬器，用於測試檢測引擎效果
 - **自適應檢測閾值**: 根據進程類型調整檢測敏感度
 - **白名單機制**: 支援系統進程白名單，避免誤報
 - **詳細日誌記錄**: 完整的攻擊檢測和系統狀態日誌
+- **反取證技術**: 支援記憶體指紋混淆和動態環境混淆
+- **分散式多線程**: 使用多線程架構進行並行檢測
 
 ## 項目組件
 
 ### 1. 檢測引擎 (real_detection_engine.exe)
-- 實時監控系統進程
+- 實時監控系統進程（支援掃描前200個進程）
 - 掃描內存區域檢測攻擊模式
 - 智能進程優先級排序
 - 多線程檢測架構
+- 支援反取證模式（ENTROPY=7.2）
 
 ### 2. 攻擊模擬器 (attack_simulator.exe)
-- 模擬ROP攻擊
+- 模擬分散式ROP攻擊（Scattered ROP）
 - 模擬緩衝區溢出攻擊
 - 模擬堆損壞攻擊
 - 模擬Shellcode注入攻擊
 - 模擬Use-After-Free攻擊
+- 支援JIT即時編譯技術
 
 ### 3. 內存監控器 (memory_monitor.exe)
 - 基礎內存監控功能
 - 進程信息收集
+- 記憶體區域完整性檢查
 
 ## 性能指標
 
@@ -44,20 +49,30 @@
 ## 項目結構
 
 ```
-RealTimeMemoryAttackDetectEngine/
+RMDS/
 ├── src/                    # 核心源碼
 │   ├── detection_engine.cpp      # 檢測引擎實現
 │   ├── attack_simulator.cpp      # 攻擊模擬器
 │   ├── memory_monitor.cpp        # 內存監控器
-│   ├── real_memory_detection_engine.cpp  # 核心檢測邏輯
-│   └── logger.cpp                # 日誌系統
+│   ├── memory_monitor_main.cpp   # 內存監控器主程序
+│   ├── logger.cpp                # 日誌系統
+│   ├── memory_detection_utils.cpp # 工具函數
+│   ├── memory_detection_veh.cpp  # 向量化異常處理
+│   ├── performance_monitor.cpp   # 性能監控
+│   └── process_lists.cpp         # 進程列表管理
 ├── include/              # 頭檔案
-│   ├── real_memory_detection_engine.hpp
-│   ├── real_memory_detection_monitor.hpp
+│   ├── memory_detection_monitor.hpp
+│   ├── memory_detection_types.hpp
+│   ├── memory_detection_utils.hpp
+│   ├── memory_detection_veh.hpp
+│   ├── detection_engine.hpp
 │   └── utils/
-├── examples/            # 使用範例
+│       ├── logger.hpp
+│       └── performance_monitor.hpp
 ├── docs/               # 文檔
-└── build/              # 建置檔案
+├── build/              # 建置檔案
+├── run.bat            # 快速啟動腳本
+└── CMakeLists.txt     # CMake配置
 ```
 
 ## 快速開始
@@ -91,21 +106,29 @@ cmake --build . --config Release
 
 ### 運行測試
 
+#### 方法一：使用快速啟動腳本
+```bash
+# 以管理員權限運行
+run.bat
+```
+
+#### 方法二：手動運行
 1. **啟動檢測引擎**:
    ```bash
    cd build/src/Release
-   ./real_detection_engine.exe
+   ./real_detection_engine.exe /stealth /antidetect /entropy=7.2
    ```
 
 2. **運行攻擊模擬器**:
    ```bash
    cd build/src/Release
-   ./attack_simulator.exe
+   ./attack_simulator.exe /dynamic /jitc
    ```
 
 3. **查看日誌**:
    - 檢測引擎日誌: `logs/detection_engine.log`
-- 攻擊模擬器日誌: `logs/simple_attack_simulator.log`
+   - 攻擊模擬器日誌: `logs/simple_attack_simulator.log`
+   - 內存監控器日誌: `logs/memory_monitor.log`
 
 ## 使用說明
 
@@ -115,6 +138,7 @@ cmake --build . --config Release
 - 深度掃描攻擊模擬器進程
 - 實時內存區域檢測
 - 詳細日誌記錄
+- 支援反取證模式
 
 ### 攻擊模擬器功能
 - 選擇攻擊類型（1-5）
@@ -122,6 +146,14 @@ cmake --build . --config Release
 - 注入攻擊代碼
 - 驗證內存內容
 - 統計攻擊次數
+- 支援分散式ROP攻擊
+
+### 快速啟動腳本功能
+- 系統防護策略調整
+- 進程注入保護
+- 動態環境混淆
+- 虛擬執行環境建立
+- 自動清理程序（60分鐘後）
 
 ## 配置選項
 
@@ -130,11 +162,16 @@ cmake --build . --config Release
 - `scan_interval`: 掃描間隔（毫秒）
 - `memory_scan_depth`: 內存掃描深度
 - `whitelist_processes`: 白名單進程列表
+- `/stealth`: 啟用隱身模式
+- `/antidetect`: 啟用反檢測模式
+- `/entropy=7.2`: 設定熵值混淆
 
 ### 攻擊模擬器配置
 - 可執行內存分配大小
 - 攻擊代碼注入模式
 - 內存驗證選項
+- `/dynamic`: 啟用動態模式
+- `/jitc`: 啟用JIT編譯
 
 ## 日誌分析
 
@@ -143,11 +180,27 @@ cmake --build . --config Release
 - 內存區域檢測
 - 攻擊檢測警報
 - 系統狀態信息
+- ROP攻擊檢測記錄
 
 ### 攻擊模擬器日誌
 - 攻擊執行過程
 - 內存分配信息
 - 攻擊統計數據
+- 分散式ROP區域信息
+
+## 技術特性
+
+### 反取證技術
+- **記憶體指紋混淆**: 使用熵值混淆技術
+- **動態環境混淆**: 隨機目錄和虛擬執行環境
+- **進程注入保護**: 系統層級繞過技術
+- **JIT即時編譯**: 動態代碼生成
+
+### 檢測技術
+- **分散式ROP檢測**: 檢測分散在多個記憶體區域的ROP鏈
+- **現代Shellcode檢測**: 支援多種現代攻擊框架特徵
+- **自適應閾值**: 根據進程類型調整檢測敏感度
+- **多線程架構**: 並行處理提高檢測效率
 
 ## 故障排除
 
@@ -166,8 +219,16 @@ cmake --build . --config Release
    - 以管理員身份運行
    - 檢查Windows Defender設置
 
+4. **日誌文件創建失敗**
+   - 確保logs目錄存在
+   - 檢查寫入權限
+
 ## 開發計劃
 
+- [x] 支援分散式ROP攻擊檢測
+- [x] 實現現代Shellcode檢測
+- [x] 添加反取證技術
+- [x] 統一日誌系統
 - [ ] 支援更多攻擊類型
 - [ ] 改進進程優先級算法
 - [ ] 添加圖形化界面
