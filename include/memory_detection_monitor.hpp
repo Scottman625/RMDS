@@ -164,11 +164,13 @@ using MemoryViolationCallback = std::function<void(AttackType, uint64_t, const s
  * 作為底層工具庫供 detection_engine 使用
  */
 class MemoryMonitor {
+
 protected:
     static const uint8_t* find_pattern(const uint8_t* haystack, size_t haystack_len, const char* needle, size_t needle_len);
 
     void deep_scan_process(DWORD process_id);
     void smart_scan_process(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
+
 public:
     explicit MemoryMonitor(const MemoryMonitorConfig& config = MemoryMonitorConfig{});
     ~MemoryMonitor();
@@ -184,13 +186,16 @@ public:
     // 進程監控工具函數
     void scan_processes();
     void monitor_process(DWORD process_id, const std::string& process_name);
+
     static MemoryDetectionEngine::ProcessCategory classify_process(const std::string& process_name);
     static int get_process_priority(DWORD pid, const std::string& process_name);
     
     // 記憶體掃描工具函數
     void scan_memory_regions();
     void scan_process_memory(DWORD process_id, bool is_system_process = false);
-    
+
+    void deep_scan_process(DWORD process_id);
+    void smart_scan_process(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
     
     // 完整性檢查工具函數
     void check_heap_integrity();
@@ -203,7 +208,6 @@ public:
 
     // 進階檢測函數
     static bool detect_modern_shellcode(const uint8_t* buffer, size_t size);
-    
     
     // 工具函數
     static std::string get_process_name(DWORD process_id);
@@ -229,6 +233,12 @@ public:
     void add_to_attack_chain(DWORD process_id, uint64_t address, AttackType attack_type, double confidence);
     void cleanup_old_attack_chains();
     std::vector<AttackChain> get_attack_chains() const;
+
+    // 進階檢測函數
+    void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess);
+    void analyze_gadget_distribution(DWORD process_id, const std::vector<ROPGadget>& gadgets);
+    static bool detect_modern_shellcode(const uint8_t* buffer, size_t size);
+    bool is_normal_process_behavior(const uint8_t* buffer, size_t size, const std::string& process_name);
 
 private:
     // 監控線程
