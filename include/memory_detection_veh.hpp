@@ -5,7 +5,7 @@
 #include <memory>
 #include <vector>
 #include <string>
-#include "real_memory_detection_utils.hpp"
+#include "memory_detection_utils.hpp"
 
 namespace RealMemoryDetection {
 

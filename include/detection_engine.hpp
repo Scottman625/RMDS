@@ -9,9 +9,9 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
-#include "real_memory_detection_utils.hpp"
-#include "real_memory_detection_veh.hpp"
-#include "real_memory_detection_monitor.hpp"
+#include "memory_detection_utils.hpp"
+#include "memory_detection_veh.hpp"
+#include "memory_detection_monitor.hpp"
 
 namespace RealMemoryDetection {
 
@@ -105,7 +105,7 @@ private:
     
     // 組件指針
     std::unique_ptr<VEHHandler> veh_handler_;
-    std::unique_ptr<MemoryMonitor> memory_monitor_;
+    //std::unique_ptr<MemoryMonitor> memory_monitor_;
     std::unique_ptr<Logger> logger_;
     
     // 配置
