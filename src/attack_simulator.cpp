@@ -398,10 +398,10 @@ void simulate_use_after_free() {
         free(ptr);
         
         // 嘗試使用已釋放的記憶體
-        __try {
+        try {
             memset(ptr, 0xAA, 1024); // 使用已釋放的記憶體
         }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
+        catch (...) {
             log_message("INFO", "Use-After-Free caught by exception handler");
         }
     }
@@ -853,13 +853,13 @@ void attack_loop() {
 
 // 驗證記憶體內容
 bool verify_memory_content(LPVOID address, size_t size) {
-    __try {
+    try {
         uint8_t* ptr = (uint8_t*)address;
         uint8_t test_byte = ptr[0]; // 嘗試讀取第一個字節
         test_byte = ptr[size-1];    // 嘗試讀取最後一個字節
         return true;
     }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
+    catch (...) {
         return false;
     }
 }

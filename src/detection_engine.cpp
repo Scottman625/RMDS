@@ -31,8 +31,10 @@
 #include "../include/utils/logger.hpp"
 #include "../include/utils/process_lists.hpp"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
+#endif
 
 // 添加缺少的常數定義
 #ifndef EXCEPTION_GUARD_PAGE_VIOLATION

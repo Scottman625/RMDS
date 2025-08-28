@@ -430,72 +430,72 @@ void MemoryMonitor::check_shared_memory() {
 
 bool MemoryMonitor::detect_modern_shellcode(const uint8_t* buffer, size_t size) {
     // 檢測Egg Hunter模式
-    const char egg_pattern[] = {0x66,0x81,0xCA,0xFF,0x0F,0x42,0x52,0x6A,0x02}; // NTAccessCheck
-    if (MemoryMonitor::find_pattern(buffer, size, egg_pattern, sizeof(egg_pattern))) return true;
+    constexpr unsigned char egg_pattern[] = {0x66,0x81,0xCA,0xFF,0x0F,0x42,0x52,0x6A,0x02}; // NTAccessCheck
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(egg_pattern), sizeof(egg_pattern))) return true;
 
     // 檢測反射式DLL注入特徵
-    const char reflective[] = {0xE8,0x00,0x00,0x00,0x00,0x5B,0x81,0xEB};
-    if (MemoryMonitor::find_pattern(buffer, size, reflective, sizeof(reflective))) return true;
+    constexpr unsigned char reflective[] = {0xE8,0x00,0x00,0x00,0x00,0x5B,0x81,0xEB};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(reflective), sizeof(reflective))) return true;
 
     // 檢測Cobalt Strike信標特徵
-    const char cobalt[] = {0x48,0x83,0xEC,0x28,0xB9,0x08,0x00,0x00,0x00};
-    if (MemoryMonitor::find_pattern(buffer, size, cobalt, sizeof(cobalt))) return true;
+    constexpr unsigned char cobalt[] = {0x48,0x83,0xEC,0x28,0xB9,0x08,0x00,0x00,0x00};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(cobalt), sizeof(cobalt))) return true;
     
     // 檢測Metasploit特徵
-    const char metasploit[] = {0x68,0x61,0x6C,0x6C,0x00,0x68,0x6E,0x65,0x6C,0x33,0x32}; // "hall\0" + "nel32"
-    if (MemoryMonitor::find_pattern(buffer, size, metasploit, sizeof(metasploit))) return true;
+    constexpr unsigned char metasploit[] = {0x68,0x61,0x6C,0x6C,0x00,0x68,0x6E,0x65,0x6C,0x33,0x32}; // "hall\0" + "nel32"
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(metasploit), sizeof(metasploit))) return true;
     
     // 檢測PowerShell Empire特徵
-    const char empire[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10};
-    if (MemoryMonitor::find_pattern(buffer, size, empire, sizeof(empire))) return true;
+    constexpr unsigned char empire[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(empire), sizeof(empire))) return true;
     
     // 檢測Mimikatz特徵
-    const char mimikatz[] = {0x48,0x83,0xEC,0x20,0x48,0x8B,0x05};
-    if (MemoryMonitor::find_pattern(buffer, size, mimikatz, sizeof(mimikatz))) return true;
+    constexpr unsigned char mimikatz[] = {0x48,0x83,0xEC,0x20,0x48,0x8B,0x05};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(mimikatz), sizeof(mimikatz))) return true;
     
     // 檢測Process Hollowing特徵
-    const char hollow[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
-    if (MemoryMonitor::find_pattern(buffer, size, hollow, sizeof(hollow))) return true;
+    constexpr unsigned char hollow[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(hollow), sizeof(hollow))) return true;
     
     // 檢測API Hashing特徵
-    const char api_hash[] = {0x48,0x31,0xC9,0x48,0x81,0xE9}; // xor rcx, rcx; sub rcx
-    if (MemoryMonitor::find_pattern(buffer, size, api_hash, sizeof(api_hash))) return true;
+    constexpr unsigned char api_hash[] = {0x48,0x31,0xC9,0x48,0x81,0xE9}; // xor rcx, rcx; sub rcx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(api_hash), sizeof(api_hash))) return true;
     
     // 檢測反虛擬機特徵
-    const char anti_vm[] = {0x64,0xA1,0x18,0x00,0x00,0x00,0x8B,0x40,0x30}; // PEB BeingDebugged
-    if (MemoryMonitor::find_pattern(buffer, size, anti_vm, sizeof(anti_vm))) return true;
+    constexpr unsigned char anti_vm[] = {0x64,0xA1,0x18,0x00,0x00,0x00,0x8B,0x40,0x30}; // PEB BeingDebugged
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(anti_vm), sizeof(anti_vm))) return true;
     
     // 檢測動態API解析特徵
-    const char dynamic_api[] = {0x48,0x8B,0x05,0x00,0x00,0x00,0x00,0x48,0x85,0xC0}; // mov rax, [rip+0]; test rax, rax
-    if (MemoryMonitor::find_pattern(buffer, size, dynamic_api, sizeof(dynamic_api))) return true;
+    constexpr unsigned char dynamic_api[] = {0x48,0x8B,0x05,0x00,0x00,0x00,0x00,0x48,0x85,0xC0}; // mov rax, [rip+0]; test rax, rax
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(dynamic_api), sizeof(dynamic_api))) return true;
     
     // 檢測Shellcode Loader特徵
-    const char loader[] = {0x48,0x89,0xE5,0x48,0x83,0xEC,0x20,0x48,0x89,0x5D,0xF8};
-    if (MemoryMonitor::find_pattern(buffer, size, loader, sizeof(loader))) return true;
+    constexpr unsigned char loader[] = {0x48,0x89,0xE5,0x48,0x83,0xEC,0x20,0x48,0x89,0x5D,0xF8};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(loader), sizeof(loader))) return true;
     
     // 檢測加密/解密特徵
-    const char crypto[] = {0x48,0x31,0xC0,0x48,0x31,0xC9,0x48,0x31,0xD2}; // xor rax, rax; xor rcx, rcx; xor rdx, rdx
-    if (MemoryMonitor::find_pattern(buffer, size, crypto, sizeof(crypto))) return true;
+    constexpr unsigned char crypto[] = {0x48,0x31,0xC0,0x48,0x31,0xC9,0x48,0x31,0xD2}; // xor rax, rax; xor rcx, rcx; xor rdx, rdx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(crypto), sizeof(crypto))) return true;
     
     // 檢測網絡通信特徵
-    const char network[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28};
-    if (MemoryMonitor::find_pattern(buffer, size, network, sizeof(network))) return true;
+    constexpr unsigned char network[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(network), sizeof(network))) return true;
     
     // 檢測文件操作特徵
-    const char file_ops[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D}; // lea rdx, [rip+0]; lea rcx
-    if (MemoryMonitor::find_pattern(buffer, size, file_ops, sizeof(file_ops))) return true;
+    constexpr unsigned char file_ops[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D}; // lea rdx, [rip+0]; lea rcx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(file_ops), sizeof(file_ops))) return true;
     
     // 檢測註冊表操作特徵
-    const char registry[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D,0x00,0x00,0x00,0x00};
-    if (MemoryMonitor::find_pattern(buffer, size, registry, sizeof(registry))) return true;
+    constexpr unsigned char registry[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D,0x00,0x00,0x00,0x00};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(registry), sizeof(registry))) return true;
     
     // 檢測進程注入特徵
-    const char injection[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-    if (MemoryMonitor::find_pattern(buffer, size, injection, sizeof(injection))) return true;
+    constexpr unsigned char injection[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(injection), sizeof(injection))) return true;
     
     // 檢測權限提升特徵
-    const char priv_esc[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28,0x48,0x89,0x74,0x24,0x30};
-    if (MemoryMonitor::find_pattern(buffer, size, priv_esc, sizeof(priv_esc))) return true;
+    constexpr unsigned char priv_esc[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28,0x48,0x89,0x74,0x24,0x30};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(priv_esc), sizeof(priv_esc))) return true;
     
     return false;
 }

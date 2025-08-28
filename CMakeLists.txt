@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(RealTimeMemoryAttackDetectEngine VERSION 1.0.0 LANGUAGES CXX)
 
-# 設定C++23標準
-set(CMAKE_CXX_STANDARD 23)
+# 設定C++17標準（兼容較舊的編譯器）
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # 編譯器選項
