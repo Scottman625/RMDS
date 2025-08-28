@@ -38,6 +38,15 @@
 - 進程信息收集
 - 記憶體區域完整性檢查
 
+### 4. Agent 工作流系統 (agent_system/)
+- **Orchestrator Agent** - 工作流編排與任務調度
+- **Threat Intel Agent** - 威脅情報收集與分析
+- **Feature Designer Agent** - 記憶體特徵工程
+- **Attack Simulator Agent** - 攻擊場景回放與驗證
+- 事件驅動架構，支援自動化威脅響應
+- 智能特徵生成與優化
+- 實時監控與 KPI 追蹤
+
 ## 性能指標
 
 - **檢測延遲**: 實時檢測，毫秒級響應
@@ -69,6 +78,21 @@ RMDS/
 │   └── utils/
 │       ├── logger.hpp
 │       └── performance_monitor.hpp
+├── agent_system/         # Agent 工作流系統
+│   ├── agents/           # Agent 實作
+│   │   ├── base_agent.py
+│   │   ├── orchestrator.py
+│   │   ├── threat_intel.py
+│   │   ├── feature_designer.py
+│   │   └── attack_simulator.py
+│   ├── events/           # 事件系統
+│   │   └── event_bus.py
+│   ├── main.py           # 主程序
+│   ├── test_system.py    # 測試腳本
+│   ├── run_agent_system.py # 啟動腳本
+│   ├── start_agents.bat  # Windows 批處理
+│   ├── requirements.txt  # Python 依賴
+│   └── README.md         # Agent 系統文檔
 ├── docs/               # 文檔
 ├── build/              # 建置檔案
 ├── run.bat            # 快速啟動腳本
@@ -83,6 +107,7 @@ RMDS/
 - Visual Studio 2022 或更高版本
 - CMake 3.20+
 - C++23 標準支援
+- Python 3.8+ (用於 Agent 系統)
 
 ### 建置步驟
 
@@ -129,6 +154,35 @@ run.bat
    - 檢測引擎日誌: `logs/detection_engine.log`
    - 攻擊模擬器日誌: `logs/simple_attack_simulator.log`
    - 內存監控器日誌: `logs/memory_monitor.log`
+
+### Agent 工作流系統
+
+#### 快速啟動
+```bash
+# 進入 Agent 系統目錄
+cd agent_system
+
+# 初始設置
+python run_agent_system.py --setup
+
+# 運行演示模式
+python run_agent_system.py --demo
+
+# 運行系統測試
+python run_agent_system.py --test
+
+# 正常啟動
+python run_agent_system.py
+```
+
+#### 或使用批處理腳本
+```bash
+# Windows 批處理啟動
+start_agents.bat --demo    # 演示模式
+start_agents.bat --test    # 測試模式
+start_agents.bat --setup   # 初始設置
+start_agents.bat           # 正常模式
+```
 
 ## 使用說明
 
@@ -229,6 +283,7 @@ run.bat
 - [x] 實現現代Shellcode檢測
 - [x] 添加反取證技術
 - [x] 統一日誌系統
+- [x] **Agent 工作流系統** - 自動化威脅響應與特徵工程
 - [ ] 支援更多攻擊類型
 - [ ] 改進進程優先級算法
 - [ ] 添加圖形化界面

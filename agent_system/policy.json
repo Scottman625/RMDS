@@ -1,0 +1,45 @@
+{
+  "write_allow": [
+    "src/**/*.cpp",
+    "src/**/*.hpp",
+    "include/**/*.hpp",
+    "tests/**/*.cpp",
+    "tests/**/*.hpp",
+    "CMakeLists.txt",
+    "docs/**/*.md"
+  ],
+  "read_allow": [
+    "src/**/*",
+    "include/**/*",
+    "tests/**/*",
+    "CMakeLists.txt",
+    "README.md",
+    "docs/**/*",
+    "agent_system/**/*",
+    "*.cpp",
+    "*.hpp"
+  ],
+  "deny": [
+    "secrets/**",
+    ".env*",
+    "*.key",
+    "*.pem",
+    "build/**",
+    ".git/**",
+    "logs/**",
+    "*.log"
+  ],
+  "max_patch_size": 1000,
+  "max_file_size_mb": 10,
+  "timeout_seconds": 300,
+  "rate_limits": {
+    "apply_patch_per_hour": 10,
+    "read_file_per_minute": 60,
+    "run_tests_per_hour": 5
+  },
+  "security": {
+    "require_dry_run_first": true,
+    "max_concurrent_operations": 3,
+    "audit_all_operations": true
+  }
+}
