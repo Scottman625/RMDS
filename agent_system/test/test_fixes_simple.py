@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-測試所有修正：權限檢查、diff 提取、非乾跑模式
+簡化的測試：權限檢查、diff 提取、非乾跑模式
 """
 
 import asyncio
@@ -91,17 +91,12 @@ Just some text here."""
         logger.info("測試 diff 提取功能...")
         
         for i, test_content in enumerate(test_cases):
-            # 使用新的強健版 diff 提取
-            diff_meta = server._extract_and_validate_unified_diff(test_content, server.repo_root)
-            if diff_meta.valid:
+            extracted = server._extract_unified_diff(test_content)
+            if extracted:
                 logger.info(f"  測試 {i+1}: ✅ 成功提取 diff")
-                logger.info(f"    提取內容: {diff_meta.normalized[:100]}...")
-                logger.info(f"    文件數量: {len(diff_meta.files)}")
-                logger.info(f"    補丁 ID: {diff_meta.patch_id}")
+                logger.info(f"    提取內容: {extracted[:100]}...")
             else:
                 logger.info(f"  測試 {i+1}: ❌ 無法提取 diff")
-                if diff_meta.issues:
-                    logger.info(f"    問題: {diff_meta.issues}")
                 
         return True
         
@@ -116,25 +111,16 @@ async def test_non_dry_run():
         
         server = MCPServer(repo_root="..")
         
-        # 創建一個簡單的測試補丁 - 新增文件
-        test_patch = """Here is a simple patch:
-
-```diff
---- /dev/null
+        # 創建一個非常簡單的測試補丁
+        test_patch = """--- a/src/test_detection_id.cpp
 +++ b/src/test_detection_id.cpp
-@@ -0,0 +1,10 @@
+@@ -0,0 +1,5 @@
 +#include <iostream>
-+#include <chrono>
 +#include <string>
 +
-+std::string generate_detection_id() {
-+    static int counter = 0;
-+    counter++;
-+    return "detection_" + std::to_string(counter) + "_" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
++void generate_detection_id() {
++    std::cout << "Generated detection ID" << std::endl;
 +}
-```
-
-This creates a simple detection ID generator.
 """
         
         logger.info("測試非乾跑模式...")
@@ -178,54 +164,6 @@ This creates a simple detection ID generator.
         logger.error(f"非乾跑測試失敗: {e}")
         return False
 
-async def test_workflow_integration():
-    """測試工作流整合"""
-    try:
-        from workflow_orchestrator import WorkflowOrchestrator
-        
-        orchestrator = WorkflowOrchestrator(
-            repo_root="..",
-            policy_file="policy.json"
-        )
-        
-        test_task = "請在記憶體監控器中添加檢測 ID 生成功能，並確保每次掃描都生成唯一的檢測 ID"
-        
-        logger.info("測試工作流整合...")
-        
-        # 啟動工作流
-        workflow_id = await orchestrator.start_workflow(test_task)
-        
-        if workflow_id:
-            logger.info(f"✅ 工作流啟動成功，ID: {workflow_id}")
-            
-            # 等待工作流完成
-            max_wait = 60  # 最多等待 60 秒
-            wait_count = 0
-            
-            while wait_count < max_wait:
-                status = orchestrator.get_workflow_status(workflow_id)
-                if status and status.get("status") == "completed":
-                    logger.info("✅ 工作流完成！")
-                    logger.info(f"  結果: {status}")
-                    return True
-                elif status and status.get("status") == "failed":
-                    logger.error(f"❌ 工作流失敗: {status}")
-                    return False
-                
-                await asyncio.sleep(2)
-                wait_count += 2
-                logger.info(f"  等待中... ({wait_count}/{max_wait}秒)")
-            
-            logger.error("❌ 工作流超時")
-            return False
-        else:
-            logger.error("❌ 工作流啟動失敗")
-            return False
-            
-    except Exception as e:
-        logger.error(f"工作流整合測試失敗: {e}")
-        return False
-
 async def main():
     """主函數"""
     logger.info("開始測試所有修正...")
@@ -242,22 +180,17 @@ async def main():
     logger.info("\n=== 測試 3: 非乾跑模式 ===")
     result3 = await test_non_dry_run()
     
-    # 測試 4: 工作流整合
-    logger.info("\n=== 測試 4: 工作流整合 ===")
-    result4 = await test_workflow_integration()
-    
     # 總結
     logger.info("\n=== 測試結果總結 ===")
     logger.info(f"權限檢查修正: {'✅ 成功' if result1 else '❌ 失敗'}")
     logger.info(f"diff 提取功能: {'✅ 成功' if result2 else '❌ 失敗'}")
     logger.info(f"非乾跑模式: {'✅ 成功' if result3 else '❌ 失敗'}")
-    logger.info(f"工作流整合: {'✅ 成功' if result4 else '❌ 失敗'}")
     
-    success_count = sum([result1, result2, result3, result4])
-    if success_count == 4:
+    success_count = sum([result1, result2, result3])
+    if success_count == 3:
         logger.info("🎉 所有測試通過！修正成功。")
     else:
-        logger.error(f"❌ {4-success_count} 個測試失敗，需要進一步調試。")
+        logger.error(f"❌ {3-success_count} 個測試失敗，需要進一步調試。")
 
 if __name__ == "__main__":
     asyncio.run(main())

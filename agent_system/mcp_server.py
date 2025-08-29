@@ -15,10 +15,11 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional, Tuple
+from dataclasses import dataclass, asdict, field
 import fnmatch
 import shutil
+import re
 
 # 配置日誌
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +48,35 @@ class ActionResult:
     error: Optional[str] = None
     trace_id: str = None
     timestamp: str = None
+
+@dataclass
+class PatchHunk:
+    """表示一個 diff hunk"""
+    old_start: int
+    old_len: int
+    new_start: int
+    new_len: int
+    lines: List[str] = field(default_factory=list)  # 原始帶前綴的行
+
+@dataclass
+class FilePatch:
+    """表示一個文件的 patch"""
+    old_path: str
+    new_path: str
+    status: str  # modified|new|deleted|renamed
+    hunks: List[PatchHunk] = field(default_factory=list)
+    header_lines: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+@dataclass
+class DiffMeta:
+    """diff 元數據"""
+    raw: str
+    normalized: str
+    files: List[Dict[str, Any]]
+    issues: List[str]
+    valid: bool
+    patch_id: Optional[str]
 
 class MCPServer:
     """MCP 服務器"""
@@ -235,7 +265,6 @@ class MCPServer:
                              .replace("**/", r"(.*/)?")
                              .replace("**", r".*")
                              .replace("*", r"[^/]*"))
-                    import re
                     if re.fullmatch(regex, path_str):
                         return True
                 logger.warning(f"Write access denied (no pattern match): {path_str}")
@@ -377,45 +406,135 @@ class MCPServer:
             self._log_action("read_file", params, result)
             return result
     
+    def write_file(self, params: Dict[str, Any]) -> ActionResult:
+        """寫入文件"""
+        trace_id = self._generate_trace_id()
+        logger.info(f"[WRITE_FILE] Starting file write, trace_id: {trace_id}")
+        
+        try:
+            file_path = params["path"]
+            content = params["content"]
+            create_dirs = params.get("create_dirs", True)
+            
+            logger.info(f"[WRITE_FILE] Parameters: path={file_path}, content_length={len(content)}, create_dirs={create_dirs}")
+            
+            if not self._check_permission(file_path, "write"):
+                logger.error(f"[WRITE_FILE] Write access denied for: {file_path}")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Write access denied: {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            full_path = self.repo_root / file_path
+            
+            # 檢查文件大小限制
+            if len(content) > self.policy.max_file_size_mb * 1024 * 1024:
+                logger.error(f"[WRITE_FILE] Content too large: {len(content)} bytes (max: {self.policy.max_file_size_mb}MB)")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Content too large: {len(content)} bytes (max: {self.policy.max_file_size_mb}MB)",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 創建目錄（如果需要）
+            if create_dirs:
+                logger.info(f"[WRITE_FILE] Creating directories for: {full_path.parent}")
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 寫入文件
+            logger.info(f"[WRITE_FILE] Writing content to: {full_path}")
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # 獲取文件信息
+            file_hash = self._get_file_hash(full_path)
+            file_size = full_path.stat().st_size
+            
+            result = ActionResult(
+                success=True,
+                data={
+                    "path": file_path,
+                    "size": file_size,
+                    "lines": len(content.splitlines()),
+                    "hash": file_hash,
+                    "created": not full_path.exists() if not create_dirs else True
+                },
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            
+            self._log_action("write_file", params, result)
+            return result
+        
+        except Exception as e:
+            logger.error(f"[WRITE_FILE] Unexpected error: {e}")
+            result = ActionResult(
+                success=False,
+                data={},
+                error=str(e),
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self._log_action("write_file", params, result)
+            return result
+    
     def apply_patch(self, params: Dict[str, Any]) -> ActionResult:
         """應用補丁"""
         trace_id = self._generate_trace_id()
+        logger.info(f"[APPLY_PATCH] Starting patch application, trace_id: {trace_id}")
         
         try:
             branch = params.get("branch", "master")
-            patch_content = params["unified_diff"]
+            patch_content = params.get("unified_diff", "")
+            task_id = params.get("task_id", "unknown")
             dry_run = params.get("dry_run", True)
             commit_changes = params.get("commit", True)
-            task_id = params.get("task_id", "unknown")
             
-            # 擷取真正的 diff 區塊（防止 LLM 包裝文字）
-            patch_content = self._extract_unified_diff(patch_content)
-            if not patch_content:
+            logger.info(f"[APPLY_PATCH] Parameters: branch={branch}, dry_run={dry_run}, commit={commit_changes}")
+            logger.info(f"[APPLY_PATCH] Patch content length: {len(patch_content)}")
+            logger.debug(f"[APPLY_PATCH] Patch content: {patch_content[:500]}...")
+            
+            if not patch_content.strip():
+                logger.error(f"[APPLY_PATCH] Empty patch content")
                 return ActionResult(
                     success=False,
                     data={},
-                    error="No valid unified diff block found",
+                    error="Empty patch content",
                     trace_id=trace_id,
                     timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                 )
             
-            # 檢查補丁大小
-            patch_lines = len(patch_content.splitlines())
-            if patch_lines > self.policy.max_patch_size:
+            # 使用新的強健 diff 解析和驗證
+            diff_meta = self._extract_and_validate_unified_diff(patch_content, self.repo_root)
+            logger.info(f"[APPLY_PATCH] Diff validation result: valid={diff_meta.valid}, issues={diff_meta.issues}")
+            
+            if not diff_meta.valid:
+                logger.error(f"[APPLY_PATCH] Diff validation failed: {diff_meta.issues}")
                 return ActionResult(
                     success=False,
                     data={},
-                    error=f"Patch too large: {patch_lines} lines (max: {self.policy.max_patch_size})",
+                    error=f"Invalid diff: {'; '.join(diff_meta.issues)}",
                     trace_id=trace_id,
                     timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                 )
             
-            # 解析補丁中的文件路徑
+            # 使用驗證後的標準化 diff
+            patch_content = diff_meta.normalized
+            patch_id = diff_meta.patch_id
+            
+            # 檢查文件權限
             modified_files = []
-            for line in patch_content.splitlines():
-                if line.startswith("+++ b/"):
-                    file_path = line[6:]
+            for file_info in diff_meta.files:
+                file_path = file_info.get("new_path", file_info.get("old_path", ""))
+                if file_path and file_path != "/dev/null":
+                    logger.info(f"[APPLY_PATCH] Checking write permission for: {file_path}")
                     if not self._check_permission(file_path, "write"):
+                        logger.error(f"[APPLY_PATCH] Write access denied for: {file_path}")
                         return ActionResult(
                             success=False,
                             data={},
@@ -425,28 +544,41 @@ class MCPServer:
                         )
                     modified_files.append(file_path)
             
+            logger.info(f"[APPLY_PATCH] Files to be modified: {modified_files}")
+            
             if not modified_files:
+                logger.warning(f"[APPLY_PATCH] No files to modify found in diff")
                 return ActionResult(
                     success=False,
                     data={},
-                    error="Diff parsed but contains no modified files",
+                    error="No files to modify found in diff",
                     trace_id=trace_id,
                     timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                 )
             
             # 切換到指定分支
+            logger.info(f"[APPLY_PATCH] Switching to branch: {branch}")
             try:
-                subprocess.run(
+                result = subprocess.run(
                     ["git", "checkout", branch],
                     cwd=self.repo_root,
-                    check=True,
                     capture_output=True,
                     text=True,
                     encoding='utf-8',
                     errors='ignore',
                     timeout=self.policy.timeout_seconds
                 )
+                if result.returncode != 0:
+                    logger.error(f"[APPLY_PATCH] Git checkout failed: {result.stderr}")
+                    return ActionResult(
+                        success=False,
+                        data={},
+                        error=f"Git checkout failed: {result.stderr}",
+                        trace_id=trace_id,
+                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                    )
             except subprocess.TimeoutExpired:
+                logger.error(f"[APPLY_PATCH] Git checkout timeout")
                 return ActionResult(
                     success=False,
                     data={},
@@ -454,17 +586,12 @@ class MCPServer:
                     trace_id=trace_id,
                     timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                 )
-            except subprocess.CalledProcessError as e:
-                return ActionResult(
-                    success=False,
-                    data={},
-                    error=f"Git checkout failed: {e.stderr}",
-                    trace_id=trace_id,
-                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
-                )
+            
+            patch_lines = len(patch_content.splitlines())
             
             if dry_run:
-                # 乾運行：檢查補丁是否可以應用
+                logger.info(f"[APPLY_PATCH] Performing dry run")
+                # 乾運行檢查
                 try:
                     result = subprocess.run(
                         ["git", "apply", "--check", "-"],
@@ -477,18 +604,26 @@ class MCPServer:
                         timeout=self.policy.timeout_seconds
                     )
                     
+                    logger.info(f"[APPLY_PATCH] Dry run result: returncode={result.returncode}")
+                    if result.stderr:
+                        logger.debug(f"[APPLY_PATCH] Dry run stderr: {result.stderr}")
+                    
                     if result.returncode == 0:
+                        logger.info(f"[APPLY_PATCH] Dry run successful")
                         return ActionResult(
                             success=True,
                             data={
                                 "dry_run": True,
                                 "would_modify": modified_files,
-                                "patch_size": patch_lines
+                                "patch_size": patch_lines,
+                                "patch_id": patch_id,
+                                "diff_meta_issues": diff_meta.issues
                             },
                             trace_id=trace_id,
                             timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                         )
                     else:
+                        logger.error(f"[APPLY_PATCH] Dry run failed: {result.stderr}")
                         return ActionResult(
                             success=False,
                             data={},
@@ -496,8 +631,8 @@ class MCPServer:
                             trace_id=trace_id,
                             timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                         )
-                
                 except subprocess.TimeoutExpired:
+                    logger.error(f"[APPLY_PATCH] Dry run timeout")
                     return ActionResult(
                         success=False,
                         data={},
@@ -505,11 +640,10 @@ class MCPServer:
                         trace_id=trace_id,
                         timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                     )
-            
             else:
+                logger.info(f"[APPLY_PATCH] Applying patch for real")
                 # 實際應用補丁
                 try:
-                    # 應用補丁
                     result = subprocess.run(
                         ["git", "apply", "-"],
                         cwd=self.repo_root,
@@ -521,7 +655,12 @@ class MCPServer:
                         timeout=self.policy.timeout_seconds
                     )
                     
+                    logger.info(f"[APPLY_PATCH] Apply result: returncode={result.returncode}")
+                    if result.stderr:
+                        logger.debug(f"[APPLY_PATCH] Apply stderr: {result.stderr}")
+                    
                     if result.returncode != 0:
+                        logger.error(f"[APPLY_PATCH] Patch apply failed: {result.stderr}")
                         return ActionResult(
                             success=False,
                             data={},
@@ -532,39 +671,53 @@ class MCPServer:
                     
                     commit_hash = None
                     if commit_changes:
+                        logger.info(f"[APPLY_PATCH] Committing changes")
                         # add + commit
-                        subprocess.run(
-                            ["git", "add"] + modified_files,
-                            cwd=self.repo_root,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            encoding='utf-8',
-                            errors='ignore',
-                            timeout=self.policy.timeout_seconds
-                        )
-                        
-                        commit_message = f"Agent patch - {task_id} - {trace_id}"
-                        subprocess.run(
-                            ["git", "commit", "-m", commit_message],
-                            cwd=self.repo_root,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            encoding='utf-8',
-                            errors='ignore',
-                            timeout=self.policy.timeout_seconds
-                        )
-                        
-                        commit_hash = subprocess.check_output(
-                            ["git", "rev-parse", "HEAD"],
-                            cwd=self.repo_root,
-                            text=True,
-                            encoding='utf-8',
-                            errors='ignore',
-                            timeout=self.policy.timeout_seconds
-                        ).strip()
+                        try:
+                            subprocess.run(
+                                ["git", "add"] + modified_files,
+                                cwd=self.repo_root,
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                                encoding='utf-8',
+                                errors='ignore',
+                                timeout=self.policy.timeout_seconds
+                            )
+                            
+                            commit_message = f"Agent patch - {task_id} - {trace_id}"
+                            subprocess.run(
+                                ["git", "commit", "-m", commit_message],
+                                cwd=self.repo_root,
+                                check=True,
+                                capture_output=True,
+                                text=True,
+                                encoding='utf-8',
+                                errors='ignore',
+                                timeout=self.policy.timeout_seconds
+                            )
+                            
+                            commit_hash = subprocess.check_output(
+                                ["git", "rev-parse", "HEAD"],
+                                cwd=self.repo_root,
+                                text=True,
+                                encoding='utf-8',
+                                errors='ignore',
+                                timeout=self.policy.timeout_seconds
+                            ).strip()
+                            
+                            logger.info(f"[APPLY_PATCH] Commit successful, hash: {commit_hash}")
+                        except subprocess.CalledProcessError as e:
+                            logger.error(f"[APPLY_PATCH] Git commit failed: {e}")
+                            return ActionResult(
+                                success=False,
+                                data={},
+                                error=f"Git commit failed: {e}",
+                                trace_id=trace_id,
+                                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                            )
                     
+                    logger.info(f"[APPLY_PATCH] Patch application completed successfully")
                     return ActionResult(
                         success=True,
                         data={
@@ -573,13 +726,14 @@ class MCPServer:
                             "commit": commit_changes,
                             "commit_hash": commit_hash,
                             "patch_size": patch_lines,
-                            "patch_id": hashlib.sha256(patch_content.encode('utf-8')).hexdigest()[:16]
+                            "patch_id": patch_id,
+                            "diff_meta_issues": diff_meta.issues
                         },
                         trace_id=trace_id,
                         timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                     )
-                
                 except subprocess.TimeoutExpired:
+                    logger.error(f"[APPLY_PATCH] Patch apply timeout")
                     return ActionResult(
                         success=False,
                         data={},
@@ -587,16 +741,9 @@ class MCPServer:
                         trace_id=trace_id,
                         timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                     )
-                except subprocess.CalledProcessError as e:
-                    return ActionResult(
-                        success=False,
-                        data={},
-                        error=f"Git operation failed: {e.stderr}",
-                        trace_id=trace_id,
-                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
-                    )
         
         except Exception as e:
+            logger.error(f"[APPLY_PATCH] Unexpected error: {e}")
             result = ActionResult(
                 success=False,
                 data={},
@@ -607,48 +754,303 @@ class MCPServer:
             self._log_action("apply_patch", params, result)
             return result
 
-    def _extract_unified_diff(self, text: str) -> str:
-        """從 LLM 回傳文字中擷取第一個合法 unified diff 區塊"""
-        lines = text.splitlines()
-        in_code = False
-        candidates = []
+    def _extract_and_validate_unified_diff(self, text: str, workspace_root: Path) -> DiffMeta:
+        """
+        強健版 diff 提取與驗證
         
-        for i, line in enumerate(lines):
-            low = line.strip().lower()
-            if low.startswith("```"):
-                if in_code:
-                    in_code = False
+        回傳結構:
+        {
+          "raw": 原始抽取段,
+          "normalized": 正規化後 diff (可能多檔),
+          "files": [ FilePatch 序列化 ],
+          "issues": [字串],
+          "valid": bool,
+          "patch_id": str
+        }
+        """
+        raw = self._extract_all_diff_text(text)
+        if not raw:
+            return DiffMeta(
+                raw="", 
+                normalized="", 
+                files=[], 
+                issues=["ERR_NO_DIFF_FOUND"], 
+                valid=False, 
+                patch_id=None
+            )
+        
+        files, issues = self._parse_unified_diff(raw)
+        validate_issues = self._validate_file_patches(files, workspace_root)
+        issues.extend(validate_issues)
+        
+        normalized = self._rebuild_unified_diff(files)
+        patch_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        
+        return DiffMeta(
+            raw=raw,
+            normalized=normalized,
+            files=[self._serialize_file_patch(fp) for fp in files],
+            issues=issues,
+            valid=len([i for i in issues if i.startswith("ERR_")]) == 0 and len(files) > 0,
+            patch_id=patch_id
+        )
+    
+    def _extract_all_diff_text(self, text: str) -> str:
+        """
+        1) 優先於 code fence (```...``` 或 ```diff) 中擷取 diff
+        2) 若無 fence，掃描整體
+        支援多檔案 diff --git or ---/+++ 組合
+        """
+        lines = text.splitlines()
+        
+        # 收集所有候選
+        code_blocks = []
+        in_block = False
+        block_lang = ""
+        current = []
+        
+        for line in lines:
+            m = re.match(r"^```(\w+)?\s*$", line.strip())
+            if m:
+                if in_block:
+                    # 結束
+                    if current:
+                        code_blocks.append((block_lang.lower(), "\n".join(current)))
+                    in_block = False
+                    current = []
+                    block_lang = ""
                 else:
-                    # 進入 code block；不強制要求 diff 關鍵字，因 LLM 可能省略
-                    in_code = True
+                    in_block = True
+                    block_lang = (m.group(1) or "").lower()
                 continue
             
-            if line.startswith("--- ") and (" a/" in line or line.startswith("--- a/")):
-                # 從這裡收集直到遇到下一個 diff 開始或文件結束
-                block = [line]
-                j = i + 1
-                while j < len(lines):
-                    next_line = lines[j]
-                    # 檢查是否遇到下一個 diff 開始（必須是完整的 --- a/ 格式）
-                    # 並且不能是純文字描述（如 "Second diff:"）
-                    if (next_line.startswith("--- ") and 
-                        (" a/" in next_line or next_line.startswith("--- a/")) and 
-                        j != i and
-                        not any(keyword in next_line.lower() for keyword in ["diff:", "patch:", "change:"])):
-                        break
-                    block.append(next_line)
-                    j += 1
-                candidates.append("\n".join(block))
+            if in_block:
+                current.append(line.rstrip("\r"))
         
-        if candidates:
-            # 取第一個
-            return candidates[0]
+        # 優先在語言為 diff/patch 的 block
+        for lang, content in code_blocks:
+            if lang in ("diff", "patch"):
+                if ("--- " in content and "+++" in content):
+                    return content
         
-        # 若沒找到，嘗試整段就是 diff
-        if text.startswith("--- "):
-            return text
+        # 再次嘗試所有 block
+        for _, content in code_blocks:
+            if ("--- " in content and "+++" in content):
+                return content
+        
+        # 無 code fence → 全文掃描：擷取從第一個 '--- a/' 或 'diff --git' 到文末
+        pattern_idx = None
+        for i, line in enumerate(lines):
+            if line.startswith("diff --git ") or (line.startswith("--- ") and " a/" in line):
+                pattern_idx = i
+                break
+        
+        if pattern_idx is not None:
+            return "\n".join(l.rstrip("\r") for l in lines[pattern_idx:])
         
         return ""
+    
+    def _parse_unified_diff(self, raw: str) -> Tuple[List[FilePatch], List[str]]:
+        """解析 unified diff 格式"""
+        files = []
+        issues = []
+        lines = raw.splitlines()
+        i = 0
+        current = None
+        hunk = None
+        hunk_header_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+        diff_git_re = re.compile(r"^diff --git a/(.+) b/(.+)")
+        
+        while i < len(lines):
+            line = lines[i]
+            
+            if diff_git_re.match(line):
+                m = diff_git_re.match(line)
+                if current:
+                    files.append(current)
+                old_p, new_p = m.group(1), m.group(2)
+                current = FilePatch(old_path=old_p, new_path=new_p, status="modified", header_lines=[line], hunks=[])
+                hunk = None
+                i += 1
+                continue
+            
+            if line.startswith("--- "):
+                # 可能沒有 diff --git 的簡化形式
+                if current:
+                    # 若還沒收集到 ---/+++ 對，上一 file 已結束
+                    if current.hunks or current.header_lines:
+                        files.append(current)
+                
+                path_part = line[4:].strip()
+                old_p = path_part[2:] if path_part.startswith("a/") else path_part
+                
+                # 下一行應該 +++
+                if i + 1 < len(lines) and lines[i+1].startswith("+++ "):
+                    new_line = lines[i+1]
+                    new_part = new_line[4:].strip()
+                    new_p = new_part[2:] if new_part.startswith("b/") else new_part
+                    current = FilePatch(old_path=old_p, new_path=new_p, status="modified", header_lines=[line, new_line], hunks=[])
+                    i += 2
+                    continue
+                else:
+                    issues.append(f"ERR_MALFORMED_HEADER at line {i+1}")
+            
+            if line.startswith("@@ "):
+                if not current:
+                    issues.append(f"ERR_ORPHAN_HUNK at line {i+1}")
+                    i += 1
+                    continue
+                
+                m = hunk_header_re.match(line)
+                if not m:
+                    issues.append(f"ERR_BAD_HUNK_HEADER line {i+1}")
+                    i += 1
+                    continue
+                
+                old_start = int(m.group(1))
+                old_len = int(m.group(2) or "1")
+                new_start = int(m.group(3))
+                new_len = int(m.group(4) or "1")
+                hunk = PatchHunk(old_start, old_len, new_start, new_len, [line])
+                current.hunks.append(hunk)
+                i += 1
+                
+                # 收集 hunk 內容直到下一個 @@ / 檔案邊界
+                while i < len(lines):
+                    l2 = lines[i]
+                    if l2.startswith("@@ ") or l2.startswith("diff --git") or l2.startswith("--- "):
+                        break
+                    if l2 and l2[0] in ("+", "-", " "):
+                        hunk.lines.append(l2)
+                    elif l2 == r"\ No newline at end of file":
+                        hunk.lines.append(l2)
+                    else:
+                        # 允許空行
+                        hunk.lines.append(l2)
+                    i += 1
+                continue
+            
+            i += 1
+        
+        if current:
+            files.append(current)
+        
+        # 狀態推斷：new file / deleted file
+        for fp in files:
+            if fp.old_path == "/dev/null":
+                fp.status = "new"
+            if fp.new_path == "/dev/null":
+                fp.status = "deleted"
+        
+        return files, issues
+    
+    def _validate_file_patches(self, files: List[FilePatch], workspace_root: Path) -> List[str]:
+        """驗證文件 patches"""
+        issues = []
+        
+        for fp in files:
+            # 路徑安全
+            if not self._sanitize_diff_path(fp.old_path) or not self._sanitize_diff_path(fp.new_path):
+                issues.append(f"ERR_UNSAFE_PATH:{fp.old_path}->{fp.new_path}")
+                continue
+            
+            # 沒有 hunk
+            if not fp.hunks and fp.status == "modified":
+                issues.append(f"ERR_NO_HUNKS:{fp.old_path}")
+            
+            # 基本 hunk 行數檢查（不做全文比對，只檢計數）
+            for h in fp.hunks:
+                minus = sum(1 for l in h.lines[1:] if l.startswith("-"))
+                plus = sum(1 for l in h.lines[1:] if l.startswith("+"))
+                context = sum(1 for l in h.lines[1:] if l.startswith(" "))
+                
+                # old_len = minus + context
+                # new_len = plus + context
+                if (minus + context) != h.old_len or (plus + context) != h.new_len:
+                    issues.append(f"WARN_LEN_MISMATCH:{fp.old_path}:{h.old_start}")
+            
+            # 上下文 spot 檢查（只檢第一行 context 作示例）
+            if fp.status == "modified" and fp.old_path != "/dev/null":
+                abs_path = workspace_root / fp.old_path
+                if abs_path.exists():
+                    try:
+                        content = abs_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                        for h in fp.hunks:
+                            first_ctx = next((l[1:] for l in h.lines[1:] if l.startswith(" ")), None)
+                            if first_ctx:
+                                idx = h.old_start - 1
+                                if idx < 0 or idx >= len(content) or content[idx].strip() != first_ctx.strip():
+                                    issues.append(f"WARN_CONTEXT_MISMATCH:{fp.old_path}:{h.old_start}")
+                    except Exception as ex:
+                        issues.append(f"WARN_IO_READ:{fp.old_path}:{ex}")
+                else:
+                    if fp.status == "modified":
+                        issues.append(f"ERR_FILE_NOT_FOUND:{fp.old_path}")
+        
+        return issues
+    
+    def _sanitize_diff_path(self, p: str) -> bool:
+        """檢查路徑安全性"""
+        if p in ("/dev/null",):
+            return True
+        if p.startswith("/") or p.startswith("\\"):
+            return False
+        if ".." in p:
+            return False
+        if any(c in p for c in ("\0", "\r")):
+            return False
+        return True
+    
+    def _rebuild_unified_diff(self, files: List[FilePatch]) -> str:
+        """重建 unified diff"""
+        out = []
+        
+        for fp in files:
+            # 最佳化：加上 diff --git 行（如果缺）
+            out.append(f"diff --git a/{fp.old_path} b/{fp.new_path}")
+            
+            if fp.status == "new":
+                out.append("new file mode 100644")
+            if fp.status == "deleted":
+                out.append("deleted file mode 100644")
+            
+            out.append(f"--- {'/dev/null' if fp.status=='new' else 'a/'+fp.old_path}")
+            out.append(f"+++ {'/dev/null' if fp.status=='deleted' else 'b/'+fp.new_path}")
+            
+            for h in fp.hunks:
+                out.append(f"@@ -{h.old_start},{h.old_len} +{h.new_start},{h.new_len} @@")
+                out.extend(h.lines[1:])  # 第一行是原始 hunk header 重新建構過了
+        
+        return "\n".join(out) + ("\n" if out else "")
+    
+    def _serialize_file_patch(self, fp: FilePatch) -> Dict[str, Any]:
+        """序列化 FilePatch"""
+        return {
+            "old_path": fp.old_path,
+            "new_path": fp.new_path,
+            "status": fp.status,
+            "hunks": [
+                {
+                    "old_start": h.old_start,
+                    "old_len": h.old_len,
+                    "new_start": h.new_start,
+                    "new_len": h.new_len,
+                    "line_count": len(h.lines)-1
+                } for h in fp.hunks
+            ]
+        }
+    
+    # 保留舊方法作為向後兼容
+    def _extract_unified_diff(self, text: str) -> str:
+        """從 LLM 回傳文字中擷取第一個合法 unified diff 區塊（向後兼容）"""
+        diff_meta = self._extract_and_validate_unified_diff(text, self.repo_root)
+        return diff_meta.normalized if diff_meta.valid else ""
+    
+    def _clean_diff_format(self, diff_content: str) -> str:
+        """清理 diff 格式，移除尾隨空格等問題（向後兼容）"""
+        # 使用新的解析和重建方法
+        files, _ = self._parse_unified_diff(diff_content)
+        return self._rebuild_unified_diff(files)
     
     def run_unit_tests(self, params: Dict[str, Any]) -> ActionResult:
         """運行單元測試"""

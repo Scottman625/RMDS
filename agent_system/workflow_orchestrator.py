@@ -502,6 +502,7 @@ class WorkflowOrchestrator:
     
     async def _execute_cpp_developer(self, workflow_id: str, task: WorkflowTask) -> Dict[str, Any]:
         """執行 C++ 開發者"""
+        logger.info(f"[CPP_DEVELOPER] Starting task {task.task_id}")
         context = self.active_workflows[workflow_id]
         
         # 讀取相關源文件
@@ -510,7 +511,10 @@ class WorkflowOrchestrator:
         })
         
         if not result.success:
+            logger.error(f"[CPP_DEVELOPER] Failed to read source file: {result.error}")
             return {"error": "Failed to read source file"}
+        
+        logger.info(f"[CPP_DEVELOPER] Successfully read source file, content length: {len(result.data.get('content', ''))}")
         
         # 構建 LLM 提示詞
         task_description = task.input_data.get("description", "實現功能需求")
@@ -533,6 +537,8 @@ class WorkflowOrchestrator:
 5. 確保代碼可讀性
 """
         
+        logger.info(f"[CPP_DEVELOPER] Sending prompt to LLM, prompt length: {len(prompt)}")
+        
         # 調用 LLM 生成代碼修改
         response = await self.llm_client.generate_response(
             task_type=TaskType.CODE_GENERATION,
@@ -542,7 +548,7 @@ class WorkflowOrchestrator:
         )
         
         if response.error:
-            logger.error(f"LLM error in code generation: {response.error}")
+            logger.error(f"[CPP_DEVELOPER] LLM error in code generation: {response.error}")
             # 如果 LLM 失敗，使用預設補丁
             sample_patch = """--- a/src/detection_engine.cpp
 +++ b/src/detection_engine.cpp
@@ -557,18 +563,139 @@ class WorkflowOrchestrator:
      // 原有的處理邏輯
  }
 """
+            logger.info(f"[CPP_DEVELOPER] Using fallback patch due to LLM error")
         else:
             # 嘗試從 LLM 響應中提取 diff
             sample_patch = response.content
-            # 如果響應不是標準 diff 格式，使用預設格式
+            logger.info(f"[CPP_DEVELOPER] LLM response received, content length: {len(sample_patch)}")
+            logger.info(f"[CPP_DEVELOPER] LLM response starts with: {sample_patch[:200]}...")
+            
+            # 如果響應不是標準 diff 格式，嘗試直接寫入文件
             if not sample_patch.startswith("---"):
-                sample_patch = f"""# LLM 生成的代碼修改建議：
+                logger.info(f"[CPP_DEVELOPER] Response is not a standard diff, attempting to parse as file content")
+                # 嘗試解析 LLM 響應，提取文件名和內容
+                lines = sample_patch.split('\n')
+                file_path = None
+                content_start = 0
+                
+                # 檢查是否是 diff 格式但以其他方式開頭
+                if sample_patch.startswith("*** Begin Patch") or "*** Update File:" in sample_patch or "*** Add File:" in sample_patch:
+                    logger.info(f"[CPP_DEVELOPER] Detected diff-like format, attempting to extract diff content")
+                    
+                    # 尋找文件路徑
+                    file_path = None
+                    for line in lines:
+                        if "*** Update File:" in line:
+                            file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                            break
+                        elif "*** Add File:" in line:
+                            file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                            break
+                    
+                    # 尋找 diff 內容的開始
+                    diff_start = -1
+                    for i, line in enumerate(lines):
+                        if line.startswith("@@"):
+                            diff_start = i
+                            break
+                    
+                    if diff_start >= 0 and file_path:
+                        # 構建完整的 diff 格式
+                        if "*** Add File:" in sample_patch:
+                            # 新文件
+                            diff_content = f"--- /dev/null\n+++ b/{file_path}\n"
+                        else:
+                            # 修改文件
+                            diff_content = f"--- a/{file_path}\n+++ b/{file_path}\n"
+                        
+                        # 添加從 @@ 開始的內容，但需要修復 @@ 標記
+                        diff_lines = lines[diff_start:]
+                        if diff_lines and diff_lines[0].startswith("@@"):
+                            # 修復 @@ 標記，添加行號信息
+                            diff_lines[0] = "@@ -1,1 +1,1 @@"
+                        
+                        diff_content += '\n'.join(diff_lines)
+                        
+                        logger.info(f"[CPP_DEVELOPER] Extracted diff content, length: {len(diff_content)}")
+                        logger.debug(f"[CPP_DEVELOPER] Extracted diff content: {diff_content[:500]}...")
+                        sample_patch = diff_content
+                    else:
+                        logger.warning(f"[CPP_DEVELOPER] Could not find diff markers or file path in response")
+                        # 如果無法解析，使用預設格式
+                        sample_patch = f"""# LLM 生成的代碼修改建議：
 {response.content}
 
 # 請手動應用以上修改到對應文件。
 """
+                else:
+                    # 尋找可能的文件路徑
+                    for i, line in enumerate(lines):
+                        logger.debug(f"[CPP_DEVELOPER] Checking line {i}: {line.strip()}")
+                        # 處理多種可能的格式
+                        line_stripped = line.strip()
+                        
+                        # 格式1: *** Add File: src/test_detection_id.cpp
+                        if line_stripped.startswith("*** Add File:") or line_stripped.startswith("*** Update File:"):
+                            file_path = line_stripped.split(":", 1)[1].strip()
+                            # 統一使用正斜杠
+                            file_path = file_path.replace('\\', '/')
+                            content_start = i + 1
+                            logger.info(f"[CPP_DEVELOPER] Found file path from '*** Add/Update File:' format: {file_path}")
+                            break
+                        
+                        # 格式2: 直接的文件路徑
+                        elif line_stripped.endswith('.cpp') or line_stripped.endswith('.hpp'):
+                            # 確保這是一個有效的文件路徑，不是其他內容
+                            if '/' in line_stripped or '\\' in line_stripped:
+                                file_path = line_stripped.replace('\\', '/')
+                                content_start = i + 1
+                                logger.info(f"[CPP_DEVELOPER] Found direct file path: {file_path}")
+                                break
+                    
+                    if file_path and content_start < len(lines):
+                        # 提取文件內容
+                        content = '\n'.join(lines[content_start:])
+                        logger.info(f"[CPP_DEVELOPER] Extracted content for {file_path}, content length: {len(content)}")
+                        
+                        # 使用 write_file 直接創建文件
+                        write_result = self.mcp_server.write_file({
+                            "path": file_path,
+                            "content": content,
+                            "create_dirs": True
+                        })
+                        
+                        logger.info(f"[CPP_DEVELOPER] Write file result: success={write_result.success}, error={write_result.error}")
+                        
+                        if write_result.success:
+                            logger.info(f"[CPP_DEVELOPER] Successfully created file: {file_path}")
+                            return {
+                                "status": "completed",
+                                "file_created": True,
+                                "file_path": file_path,
+                                "content": content,
+                                "llm_response": response.content if not response.error else None,
+                                "model_used": response.model if not response.error else None,
+                                "tokens_used": response.usage if not response.error else None
+                            }
+                        else:
+                            logger.error(f"[CPP_DEVELOPER] Failed to write file: {write_result.error}")
+                            return {"error": f"Failed to write file: {write_result.error}"}
+                    else:
+                        logger.warning(f"[CPP_DEVELOPER] Could not parse file path from LLM response")
+                        # 如果無法解析，使用預設格式
+                        sample_patch = f"""# LLM 生成的代碼修改建議：
+{response.content}
+
+# 請手動應用以上修改到對應文件。
+"""
+            else:
+                logger.info(f"[CPP_DEVELOPER] Response appears to be a standard diff format")
+        
+        logger.info(f"[CPP_DEVELOPER] Final patch content length: {len(sample_patch)}")
+        logger.debug(f"[CPP_DEVELOPER] Patch content: {sample_patch}")
         
         # 乾運行補丁
+        logger.info(f"[CPP_DEVELOPER] Starting dry run patch application")
         dry_run_result = self.mcp_server.apply_patch({
             "branch": "master",
             "unified_diff": sample_patch,
@@ -577,10 +704,14 @@ class WorkflowOrchestrator:
             "task_id": task.task_id
         })
         
+        logger.info(f"[CPP_DEVELOPER] Dry run result: success={dry_run_result.success}, error={dry_run_result.error}")
+        
         if not dry_run_result.success:
+            logger.error(f"[CPP_DEVELOPER] Patch dry run failed: {dry_run_result.error}")
             return {"error": f"Patch dry run failed: {dry_run_result.error}"}
         
         # 實際應用補丁
+        logger.info(f"[CPP_DEVELOPER] Starting actual patch application")
         apply_result = self.mcp_server.apply_patch({
             "branch": "master",
             "unified_diff": sample_patch,
@@ -589,7 +720,12 @@ class WorkflowOrchestrator:
             "task_id": task.task_id
         })
         
+        logger.info(f"[CPP_DEVELOPER] Apply result: success={apply_result.success}, error={apply_result.error}")
+        if apply_result.success:
+            logger.info(f"[CPP_DEVELOPER] Modified files: {apply_result.data.get('modified', [])}")
+        
         if not apply_result.success:
+            logger.error(f"[CPP_DEVELOPER] Patch apply failed: {apply_result.error}")
             return {"error": f"Patch apply failed: {apply_result.error}"}
         
         context.artifacts["code_changes"] = {
@@ -601,6 +737,7 @@ class WorkflowOrchestrator:
             "tokens_used": response.usage if not response.error else None
         }
         
+        logger.info(f"[CPP_DEVELOPER] Task completed successfully")
         return {
             "status": "completed",
             "patch_applied": True,
