@@ -1,0 +1,77 @@
+{
+  "write_allow": [
+    "src/**/*.cpp",
+    "src/**/*.hpp",
+    "include/**/*.hpp",
+    "tests/**/*.cpp",
+    "tests/**/*.hpp",
+    "CMakeLists.txt",
+    "docs/**/*.md",
+    "build/**/*",
+    "build/**/*.exe",
+    "build/**/*.out",
+    "build/**/*.so",
+    "build/**/*.dll",
+    "build/**/*.dylib"
+  ],
+  "read_allow": [
+    "src/**/*",
+    "include/**/*",
+    "tests/**/*",
+    "CMakeLists.txt",
+    "README.md",
+    "docs/**/*",
+    "agent_system/**/*",
+    "*.cpp",
+    "*.hpp",
+    "build/**/*",
+    "build/**/*.exe",
+    "build/**/*.out",
+    "build/**/*.so",
+    "build/**/*.dll",
+    "build/**/*.dylib",
+    "build/**/*.log",
+    "build/**/*.json",
+    "build/**/*.xml"
+  ],
+  "execute_allow": [
+    "build/**/*.exe",
+    "build/**/*.out",
+    "build/**/*.so",
+    "build/**/*.dll",
+    "build/**/*.dylib",
+    "build/src/**/*.exe",
+    "build/src/**/*.out",
+    "build/tests/**/*.exe",
+    "build/tests/**/*.out"
+  ],
+  "deny": [
+    "secrets/**",
+    ".env*",
+    "*.key",
+    "*.pem",
+    ".git/**",
+    "logs/**",
+    "*.log"
+  ],
+  "max_patch_size": 1000,
+  "max_file_size_mb": 10,
+  "timeout_seconds": 300,
+  "build_timeout_seconds": 600,
+  "execution_timeout_seconds": 120,
+  "rate_limits": {
+    "apply_patch_per_hour": 10,
+    "read_file_per_minute": 60,
+    "run_tests_per_hour": 5,
+    "build_per_hour": 3,
+    "execute_per_hour": 10
+  },
+  "security": {
+    "require_dry_run_first": true,
+    "max_concurrent_operations": 3,
+    "audit_all_operations": true,
+    "allow_build_operations": true,
+    "allow_execution": true,
+    "execution_sandbox": true
+  }
+}
