@@ -137,41 +137,34 @@ async def test_non_dry_run():
 This creates a simple detection ID generator.
 """
         
+        # 測試非乾跑模式
         logger.info("測試非乾跑模式...")
-        
-        # 測試乾運行
-        dry_run_result = server.apply_patch({
-            "branch": "event-hook",  # 使用當前分支
+        result = server.apply_patch({
             "unified_diff": test_patch,
             "dry_run": True,
             "commit": False,
-            "task_id": "test_fixes"
+            "task_id": "test_task"
         })
         
-        if not dry_run_result.success:
-            logger.error(f"乾運行失敗: {dry_run_result.error}")
-            return False
-        
-        logger.info("✅ 乾運行成功")
-        
-        # 測試實際應用（不提交）
-        apply_result = server.apply_patch({
-            "branch": "event-hook",  # 使用當前分支
-            "unified_diff": test_patch,
-            "dry_run": False,
-            "commit": False,  # 不提交
-            "task_id": "test_fixes"
-        })
-        
-        if apply_result.success:
-            logger.info("✅ 補丁應用成功！")
-            logger.info(f"  修改的文件: {apply_result.data.get('modified', [])}")
-            logger.info(f"  是否提交: {apply_result.data.get('commit', 'N/A')}")
-            logger.info(f"  提交哈希: {apply_result.data.get('commit_hash', 'N/A')}")
-            logger.info(f"  補丁 ID: {apply_result.data.get('patch_id', 'N/A')}")
-            return True
+        if result.success:
+            logger.info("✅ 乾運行成功")
+            
+            # 實際應用補丁
+            result = server.apply_patch({
+                "unified_diff": test_patch,
+                "dry_run": False,
+                "commit": False,
+                "task_id": "test_task"
+            })
+            
+            if result.success:
+                logger.info("✅ 實際應用成功")
+                logger.info(f"  修改的文件: {result.data.get('modified', [])}")
+            else:
+                logger.error(f"❌ 實際應用失敗: {result.error}")
+                return False
         else:
-            logger.error(f"❌ 補丁應用失敗: {apply_result.error}")
+            logger.error(f"❌ 乾運行失敗: {result.error}")
             return False
             
     except Exception as e:

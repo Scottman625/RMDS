@@ -17,32 +17,20 @@ def test_diff_parsing():
     
     # 測試 LLM 返回的實際格式
     test_content = """*** Begin Patch
-*** Update File: include/memory_detection_monitor.hpp
+*** Update File: src/detection_engine.cpp
 @@
- #pragma once
- #include <Windows.h>
- #include <vector>
- #include <string>
- #include <functional>
-+#include <atomic>
-+#include <chrono>
-+#include <random>
-+#include <sstream>
-+#include <iomanip>
- 
- class MemoryDetectionMonitor {
+ class DetectionEngineImpl : public RealMemoryDetectionEngine, public MemoryMonitor {
  private:
-     std::vector<std::string> detection_patterns;
-     std::function<void(const std::string&)> alert_callback;
+     // 添加 monitor 成員
+     std::unique_ptr<MemoryDetectionMonitor> monitor;
 +    std::atomic<uint64_t> detection_counter{0};
 +    std::mt19937_64 rng;
 +    std::uniform_int_distribution<uint64_t> dist;
  
  public:
-     MemoryDetectionMonitor();
-     void add_pattern(const std::string& pattern);
-     void set_alert_callback(std::function<void(const std::string&)> callback);
-     void scan_memory();
+     DetectionEngineImpl();
+     ~DetectionEngineImpl();
+     void process_event(const MemoryEvent& event) override;
 +    std::string generate_detection_id();
  };
 """

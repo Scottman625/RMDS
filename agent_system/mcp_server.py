@@ -415,8 +415,9 @@ class MCPServer:
             file_path = params["path"]
             content = params["content"]
             create_dirs = params.get("create_dirs", True)
+            mode = params.get("mode", "overwrite")  # "overwrite", "append", "prepend"
             
-            logger.info(f"[WRITE_FILE] Parameters: path={file_path}, content_length={len(content)}, create_dirs={create_dirs}")
+            logger.info(f"[WRITE_FILE] Parameters: path={file_path}, content_length={len(content)}, create_dirs={create_dirs}, mode={mode}")
             
             if not self._check_permission(file_path, "write"):
                 logger.error(f"[WRITE_FILE] Write access denied for: {file_path}")
@@ -446,10 +447,35 @@ class MCPServer:
                 logger.info(f"[WRITE_FILE] Creating directories for: {full_path.parent}")
                 full_path.parent.mkdir(parents=True, exist_ok=True)
             
+            # 根據模式決定如何寫入文件
+            file_exists = full_path.exists()
+            final_content = content
+            
+            if file_exists and mode != "overwrite":
+                # 讀取現有內容
+                try:
+                    with open(full_path, 'r', encoding='utf-8') as f:
+                        existing_content = f.read()
+                    
+                    if mode == "append":
+                        final_content = existing_content + "\n" + content
+                        logger.info(f"[WRITE_FILE] Appending content to existing file")
+                    elif mode == "prepend":
+                        final_content = content + "\n" + existing_content
+                        logger.info(f"[WRITE_FILE] Prepending content to existing file")
+                    else:
+                        logger.warning(f"[WRITE_FILE] Unknown mode '{mode}', using overwrite")
+                        final_content = content
+                except Exception as e:
+                    logger.warning(f"[WRITE_FILE] Could not read existing file: {e}, using overwrite")
+                    final_content = content
+            else:
+                logger.info(f"[WRITE_FILE] Writing content to {'existing' if file_exists else 'new'} file")
+            
             # 寫入文件
             logger.info(f"[WRITE_FILE] Writing content to: {full_path}")
             with open(full_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+                f.write(final_content)
             
             # 獲取文件信息
             file_hash = self._get_file_hash(full_path)
@@ -460,9 +486,11 @@ class MCPServer:
                 data={
                     "path": file_path,
                     "size": file_size,
-                    "lines": len(content.splitlines()),
+                    "lines": len(final_content.splitlines()),
                     "hash": file_hash,
-                    "created": not full_path.exists() if not create_dirs else True
+                    "created": not file_exists,
+                    "mode": mode,
+                    "original_size": len(content) if mode != "overwrite" else None
                 },
                 trace_id=trace_id,
                 timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
@@ -482,6 +510,201 @@ class MCPServer:
             )
             self._log_action("write_file", params, result)
             return result
+
+    def apply_diff(self, params: Dict[str, Any]) -> ActionResult:
+        """應用 diff 變更到文件（不會覆蓋整個文件）"""
+        trace_id = self._generate_trace_id()
+        logger.info(f"[APPLY_DIFF] Starting diff application, trace_id: {trace_id}")
+        
+        try:
+            file_path = params["path"]
+            diff_content = params["diff_content"]
+            
+            logger.info(f"[APPLY_DIFF] Parameters: path={file_path}, diff_length={len(diff_content)}")
+            
+            if not self._check_permission(file_path, "write"):
+                logger.error(f"[APPLY_DIFF] Write access denied for: {file_path}")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Write access denied: {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            full_path = self.repo_root / file_path
+            
+            # 讀取原始文件內容
+            if not full_path.exists():
+                logger.error(f"[APPLY_DIFF] File does not exist: {file_path}")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"File does not exist: {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            try:
+                with open(full_path, 'r', encoding='utf-8') as f:
+                    original_content = f.read()
+                logger.info(f"[APPLY_DIFF] Read original file, length: {len(original_content)}")
+            except Exception as e:
+                logger.error(f"[APPLY_DIFF] Could not read original file: {e}")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Could not read original file: {e}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 解析 diff 內容並應用變更
+            original_lines = original_content.splitlines()
+            new_lines = original_lines.copy()
+            
+            # 簡單的 diff 應用邏輯
+            diff_lines = diff_content.splitlines()
+            line_number = 0
+            
+            for line in diff_lines:
+                if line.startswith('@@'):
+                    # 解析 hunk 頭部
+                    try:
+                        # 簡單的 hunk 解析
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            # 提取行號信息
+                            line_info = parts[1]
+                            if line_info.startswith('-') and ',' in line_info:
+                                line_number = int(line_info[1:].split(',')[0]) - 1
+                                logger.info(f"[APPLY_DIFF] Found hunk at line {line_number}")
+                            else:
+                                # 如果沒有明確的行號，嘗試通過上下文匹配找到正確位置
+                                logger.warning(f"[APPLY_DIFF] No explicit line number in hunk header, attempting context matching")
+                                line_number = self._find_context_match_line(original_lines, diff_lines)
+                                logger.info(f"[APPLY_DIFF] Context matching found line {line_number}")
+                    except Exception as e:
+                        logger.warning(f"[APPLY_DIFF] Could not parse hunk header: {e}")
+                        # 嘗試通過上下文匹配找到正確位置
+                        line_number = self._find_context_match_line(original_lines, diff_lines)
+                        logger.info(f"[APPLY_DIFF] Context matching found line {line_number}")
+                        continue
+                elif line.startswith('+') and not line.startswith('++'):
+                    # 添加新行
+                    if line_number < len(new_lines):
+                        new_lines.insert(line_number, line[1:])
+                    else:
+                        new_lines.append(line[1:])
+                    line_number += 1
+                    logger.debug(f"[APPLY_DIFF] Added line at position {line_number-1}")
+                elif line.startswith('-') and not line.startswith('--'):
+                    # 移除行
+                    if line_number < len(new_lines):
+                        new_lines.pop(line_number)
+                        logger.debug(f"[APPLY_DIFF] Removed line at position {line_number}")
+                    # 不增加 line_number，因為我們移除了這一行
+                elif line.startswith(' '):
+                    # 上下文行，跳過
+                    line_number += 1
+                elif not line.startswith('@'):
+                    # 其他行，跳過
+                    line_number += 1
+            
+            # 寫入修改後的文件
+            final_content = '\n'.join(new_lines)
+            
+            # 檢查文件大小限制
+            if len(final_content) > self.policy.max_file_size_mb * 1024 * 1024:
+                logger.error(f"[APPLY_DIFF] Final content too large: {len(final_content)} bytes")
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Final content too large: {len(final_content)} bytes",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 寫入文件
+            logger.info(f"[APPLY_DIFF] Writing modified content to: {full_path}")
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(final_content)
+            
+            # 獲取文件信息
+            file_hash = self._get_file_hash(full_path)
+            file_size = full_path.stat().st_size
+            
+            result = ActionResult(
+                success=True,
+                data={
+                    "path": file_path,
+                    "original_size": len(original_content),
+                    "new_size": file_size,
+                    "original_lines": len(original_lines),
+                    "new_lines": len(new_lines),
+                    "hash": file_hash,
+                    "changes_applied": True
+                },
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            
+            self._log_action("apply_diff", params, result)
+            return result
+        
+        except Exception as e:
+            logger.error(f"[APPLY_DIFF] Unexpected error: {e}")
+            result = ActionResult(
+                success=False,
+                data={},
+                error=str(e),
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self._log_action("apply_diff", params, result)
+            return result
+
+    def _find_context_match_line(self, original_lines, diff_lines):
+        """通過上下文匹配找到正確的行號"""
+        try:
+            # 尋找 diff 中的上下文行（以空格開頭的行）
+            context_lines = []
+            for line in diff_lines:
+                if line.startswith(' ') and not line.startswith('@@'):
+                    context_lines.append(line[1:])  # 移除前導空格
+            
+            if not context_lines:
+                logger.warning("[APPLY_DIFF] No context lines found, using line 0")
+                return 0
+            
+            # 在原始文件中尋找匹配的上下文
+            for i in range(len(original_lines)):
+                # 檢查從第i行開始是否匹配上下文
+                if i + len(context_lines) <= len(original_lines):
+                    match = True
+                    for j, context_line in enumerate(context_lines):
+                        if original_lines[i + j].strip() != context_line.strip():
+                            match = False
+                            break
+                    
+                    if match:
+                        logger.info(f"[APPLY_DIFF] Found context match at line {i}")
+                        return i
+            
+            # 如果沒有找到完全匹配，嘗試部分匹配
+            for i in range(len(original_lines)):
+                for context_line in context_lines:
+                    if context_line.strip() in original_lines[i]:
+                        logger.info(f"[APPLY_DIFF] Found partial context match at line {i}")
+                        return i
+            
+            # 如果還是沒有找到，返回一個合理的默認值
+            logger.warning("[APPLY_DIFF] No context match found, using line 0")
+            return 0
+            
+        except Exception as e:
+            logger.error(f"[APPLY_DIFF] Error in context matching: {e}")
+            return 0
     
     def apply_patch(self, params: Dict[str, Any]) -> ActionResult:
         """應用補丁"""
@@ -489,13 +712,12 @@ class MCPServer:
         logger.info(f"[APPLY_PATCH] Starting patch application, trace_id: {trace_id}")
         
         try:
-            branch = params.get("branch", "master")
             patch_content = params.get("unified_diff", "")
             task_id = params.get("task_id", "unknown")
             dry_run = params.get("dry_run", True)
             commit_changes = params.get("commit", True)
             
-            logger.info(f"[APPLY_PATCH] Parameters: branch={branch}, dry_run={dry_run}, commit={commit_changes}")
+            logger.info(f"[APPLY_PATCH] Parameters: dry_run={dry_run}, commit={commit_changes}")
             logger.info(f"[APPLY_PATCH] Patch content length: {len(patch_content)}")
             logger.debug(f"[APPLY_PATCH] Patch content: {patch_content[:500]}...")
             
@@ -552,37 +774,6 @@ class MCPServer:
                     success=False,
                     data={},
                     error="No files to modify found in diff",
-                    trace_id=trace_id,
-                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
-                )
-            
-            # 切換到指定分支
-            logger.info(f"[APPLY_PATCH] Switching to branch: {branch}")
-            try:
-                result = subprocess.run(
-                    ["git", "checkout", branch],
-                    cwd=self.repo_root,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    timeout=self.policy.timeout_seconds
-                )
-                if result.returncode != 0:
-                    logger.error(f"[APPLY_PATCH] Git checkout failed: {result.stderr}")
-                    return ActionResult(
-                        success=False,
-                        data={},
-                        error=f"Git checkout failed: {result.stderr}",
-                        trace_id=trace_id,
-                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
-                    )
-            except subprocess.TimeoutExpired:
-                logger.error(f"[APPLY_PATCH] Git checkout timeout")
-                return ActionResult(
-                    success=False,
-                    data={},
-                    error="Git checkout timeout",
                     trace_id=trace_id,
                     timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                 )

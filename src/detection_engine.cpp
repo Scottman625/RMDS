@@ -1,12 +1,51 @@
 #include <iostream>
 #ifndef NOMINMAX
 #define NOMINMAX
+#include <deque>
+#include <unordered_set>
 #endif
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <thread>
+    // Scan ID generation: ensure every scan produces a unique detection/scan id.
+    // We keep a small bounded history of recent IDs to avoid accidental reuse
+    // and to provide quick lookup if needed for debugging.
+    std::atomic<uint64_t> scan_counter_{0};
+    std::mutex scan_id_mutex_;
+    std::deque<std::string> recent_scan_id_queue_;
+    std::unordered_set<std::string> recent_scan_ids_;
+
+    // Generate a compact unique scan id combining timestamp, an atomic counter and thread hash.
+    // Format: <hex-ms>_<counter>_<threadhash>
+    // This is cheap, thread-safe and designed to be unique even across threads.
+    std::string generate_scan_id() {
+        uint64_t counter = ++scan_counter_; // atomic increment
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        size_t th = std::hash<std::thread::id>{}(std::this_thread::get_id());
+
+        std::stringstream ss;
+        ss << std::hex << ms << "_" << std::dec << counter << "_" << th;
+        std::string id = ss.str();
+
+        // store in bounded history to avoid unbounded memory growth
+        {
+            std::lock_guard<std::mutex> lock(scan_id_mutex_);
+            recent_scan_id_queue_.push_back(id);
+            recent_scan_ids_.insert(id);
+            constexpr size_t MAX_RECENT_IDS = 1024;
+            if (recent_scan_id_queue_.size() > MAX_RECENT_IDS) {
+                const std::string &old = recent_scan_id_queue_.front();
+                recent_scan_ids_.erase(old);
+                recent_scan_id_queue_.pop_front();
+            }
+        }
+
+        return id;
+    }
+
 #include <vector>
 #include <atomic>
 #include <mutex>
