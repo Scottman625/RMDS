@@ -611,7 +611,6 @@ class MCPServer:
         """從 LLM 回傳文字中擷取第一個合法 unified diff 區塊"""
         lines = text.splitlines()
         in_code = False
-        buf = []
         candidates = []
         
         for i, line in enumerate(lines):
@@ -625,13 +624,19 @@ class MCPServer:
                 continue
             
             if line.startswith("--- ") and (" a/" in line or line.startswith("--- a/")):
-                # 從這裡收集直到遇到空白區塊或文件結束
+                # 從這裡收集直到遇到下一個 diff 開始或文件結束
                 block = [line]
                 j = i + 1
                 while j < len(lines):
-                    if lines[j].startswith("--- ") and j != i:
+                    next_line = lines[j]
+                    # 檢查是否遇到下一個 diff 開始（必須是完整的 --- a/ 格式）
+                    # 並且不能是純文字描述（如 "Second diff:"）
+                    if (next_line.startswith("--- ") and 
+                        (" a/" in next_line or next_line.startswith("--- a/")) and 
+                        j != i and
+                        not any(keyword in next_line.lower() for keyword in ["diff:", "patch:", "change:"])):
                         break
-                    block.append(lines[j])
+                    block.append(next_line)
                     j += 1
                 candidates.append("\n".join(block))
         
