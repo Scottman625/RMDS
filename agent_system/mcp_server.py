@@ -75,9 +75,14 @@ class MCPServer:
                     "write_allow": [
                         "src/**/*.cpp",
                         "src/**/*.hpp", 
+                        "src/*.cpp",        # 額外補上零層級
+                        "src/*.hpp",
                         "include/**/*.hpp",
+                        "include/*.hpp",
                         "tests/**/*.cpp",
                         "tests/**/*.hpp",
+                        "tests/*.cpp",
+                        "tests/*.hpp",
                         "CMakeLists.txt",
                         "build/**/*"
                     ],
@@ -161,6 +166,8 @@ class MCPServer:
                         shell=True,
                         capture_output=True,
                         text=True,
+                        encoding='utf-8',
+                        errors='ignore',
                         timeout=30
                     )
                     
@@ -221,9 +228,17 @@ class MCPServer:
             # 檢查寫入權限
             elif operation == "write":
                 for pattern in self.policy.write_allow:
-                    if fnmatch.fnmatch(path_str, pattern):
+                    # 改用更直覺的 ** 規則：** 表示 0+ 層
+                    # 將 pattern 轉換成正規表示式
+                    regex = (pattern
+                             .replace(".", r"\.")
+                             .replace("**/", r"(.*/)?")
+                             .replace("**", r".*")
+                             .replace("*", r"[^/]*"))
+                    import re
+                    if re.fullmatch(regex, path_str):
                         return True
-                logger.warning(f"Write access denied: {path_str}")
+                logger.warning(f"Write access denied (no pattern match): {path_str}")
                 return False
             
             # 檢查執行權限
@@ -367,10 +382,22 @@ class MCPServer:
         trace_id = self._generate_trace_id()
         
         try:
-            branch = params.get("branch", "main")
+            branch = params.get("branch", "master")
             patch_content = params["unified_diff"]
             dry_run = params.get("dry_run", True)
+            commit_changes = params.get("commit", True)
             task_id = params.get("task_id", "unknown")
+            
+            # 擷取真正的 diff 區塊（防止 LLM 包裝文字）
+            patch_content = self._extract_unified_diff(patch_content)
+            if not patch_content:
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error="No valid unified diff block found",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
             
             # 檢查補丁大小
             patch_lines = len(patch_content.splitlines())
@@ -398,6 +425,15 @@ class MCPServer:
                         )
                     modified_files.append(file_path)
             
+            if not modified_files:
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error="Diff parsed but contains no modified files",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
             # 切換到指定分支
             try:
                 subprocess.run(
@@ -406,6 +442,8 @@ class MCPServer:
                     check=True,
                     capture_output=True,
                     text=True,
+                    encoding='utf-8',
+                    errors='ignore',
                     timeout=self.policy.timeout_seconds
                 )
             except subprocess.TimeoutExpired:
@@ -434,6 +472,8 @@ class MCPServer:
                         input=patch_content,
                         text=True,
                         capture_output=True,
+                        encoding='utf-8',
+                        errors='ignore',
                         timeout=self.policy.timeout_seconds
                     )
                     
@@ -476,6 +516,8 @@ class MCPServer:
                         input=patch_content,
                         text=True,
                         capture_output=True,
+                        encoding='utf-8',
+                        errors='ignore',
                         timeout=self.policy.timeout_seconds
                     )
                     
@@ -488,40 +530,50 @@ class MCPServer:
                             timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
                         )
                     
-                    # 添加到暫存區
-                    subprocess.run(
-                        ["git", "add", "."],
-                        cwd=self.repo_root,
-                        check=True,
-                        capture_output=True,
-                        timeout=self.policy.timeout_seconds
-                    )
-                    
-                    # 提交變更
-                    commit_message = f"Agent patch - {task_id} - {trace_id}"
-                    subprocess.run(
-                        ["git", "commit", "-m", commit_message],
-                        cwd=self.repo_root,
-                        check=True,
-                        capture_output=True,
-                        timeout=self.policy.timeout_seconds
-                    )
-                    
-                    # 獲取提交哈希
-                    commit_hash = subprocess.check_output(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=self.repo_root,
-                        text=True,
-                        timeout=self.policy.timeout_seconds
-                    ).strip()
+                    commit_hash = None
+                    if commit_changes:
+                        # add + commit
+                        subprocess.run(
+                            ["git", "add"] + modified_files,
+                            cwd=self.repo_root,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            encoding='utf-8',
+                            errors='ignore',
+                            timeout=self.policy.timeout_seconds
+                        )
+                        
+                        commit_message = f"Agent patch - {task_id} - {trace_id}"
+                        subprocess.run(
+                            ["git", "commit", "-m", commit_message],
+                            cwd=self.repo_root,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            encoding='utf-8',
+                            errors='ignore',
+                            timeout=self.policy.timeout_seconds
+                        )
+                        
+                        commit_hash = subprocess.check_output(
+                            ["git", "rev-parse", "HEAD"],
+                            cwd=self.repo_root,
+                            text=True,
+                            encoding='utf-8',
+                            errors='ignore',
+                            timeout=self.policy.timeout_seconds
+                        ).strip()
                     
                     return ActionResult(
                         success=True,
                         data={
                             "dry_run": False,
                             "modified": modified_files,
+                            "commit": commit_changes,
                             "commit_hash": commit_hash,
-                            "patch_size": patch_lines
+                            "patch_size": patch_lines,
+                            "patch_id": hashlib.sha256(patch_content.encode('utf-8')).hexdigest()[:16]
                         },
                         trace_id=trace_id,
                         timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
@@ -554,13 +606,51 @@ class MCPServer:
             )
             self._log_action("apply_patch", params, result)
             return result
+
+    def _extract_unified_diff(self, text: str) -> str:
+        """從 LLM 回傳文字中擷取第一個合法 unified diff 區塊"""
+        lines = text.splitlines()
+        in_code = False
+        buf = []
+        candidates = []
+        
+        for i, line in enumerate(lines):
+            low = line.strip().lower()
+            if low.startswith("```"):
+                if in_code:
+                    in_code = False
+                else:
+                    # 進入 code block；不強制要求 diff 關鍵字，因 LLM 可能省略
+                    in_code = True
+                continue
+            
+            if line.startswith("--- ") and (" a/" in line or line.startswith("--- a/")):
+                # 從這裡收集直到遇到空白區塊或文件結束
+                block = [line]
+                j = i + 1
+                while j < len(lines):
+                    if lines[j].startswith("--- ") and j != i:
+                        break
+                    block.append(lines[j])
+                    j += 1
+                candidates.append("\n".join(block))
+        
+        if candidates:
+            # 取第一個
+            return candidates[0]
+        
+        # 若沒找到，嘗試整段就是 diff
+        if text.startswith("--- "):
+            return text
+        
+        return ""
     
     def run_unit_tests(self, params: Dict[str, Any]) -> ActionResult:
         """運行單元測試"""
         trace_id = self._generate_trace_id()
         
         try:
-            branch = params.get("branch", "main")
+            branch = params.get("branch", "master")
             coverage = params.get("coverage", True)
             
             # 切換分支
@@ -570,6 +660,8 @@ class MCPServer:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -583,6 +675,8 @@ class MCPServer:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -592,6 +686,8 @@ class MCPServer:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -605,6 +701,8 @@ class MCPServer:
                 cwd=build_dir,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -643,7 +741,7 @@ class MCPServer:
         trace_id = self._generate_trace_id()
         
         try:
-            branch = params.get("branch", "main")
+            branch = params.get("branch", "master")
             tools = params.get("tools", ["clang-tidy", "cppcheck"])
             
             # 切換分支
@@ -653,6 +751,8 @@ class MCPServer:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -704,6 +804,8 @@ class MCPServer:
                         cwd=self.repo_root,
                         capture_output=True,
                         text=True,
+                        encoding='utf-8',
+                        errors='ignore',
                         timeout=60
                     )
                     
@@ -736,6 +838,8 @@ class MCPServer:
                 cwd=self.repo_root,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 timeout=self.policy.timeout_seconds
             )
             
@@ -1147,6 +1251,8 @@ class MCPServer:
                 cwd=working_dir,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='ignore',
                 input=input_data,
                 timeout=self.policy.execution_timeout_seconds
             )

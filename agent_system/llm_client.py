@@ -12,6 +12,7 @@ from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass
 from enum import Enum
 import os
+from pathlib import Path
 
 # 載入環境變量
 try:
@@ -73,8 +74,11 @@ class LLMResponse:
 class LLMClient:
     """統一的 LLM 客戶端"""
     
-    def __init__(self, config_file: str = "llm_config.json"):
-        self.config_file = config_file
+    def __init__(self, config_path: str = "agent_system/llm_config.json", *args, **kwargs):
+        # ensure llm_config exists and is loaded
+        self.llm_config = {}
+        self._load_llm_config(config_path)
+        self.config_path = config_path
         self.configs = self._load_configs()
         self.clients = self._initialize_clients()
         
@@ -139,9 +143,9 @@ class LLMClient:
         }
         
         # 嘗試從配置文件載入自定義配置
-        if os.path.exists(self.config_file):
+        if os.path.exists(self.config_path):
             try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
                     custom_configs = json.load(f)
                 
                 for task_str, config_data in custom_configs.items():
@@ -189,78 +193,151 @@ class LLMClient:
         
         return clients
     
-    async def generate_response(self, task_type: TaskType, prompt: str, 
-                              context: Optional[str] = None, 
-                              system_prompt: Optional[str] = None) -> LLMResponse:
-        """生成 LLM 響應"""
-        config = self.configs.get(task_type)
-        if not config:
-            return LLMResponse(content="", error=f"No config found for task type: {task_type}")
-        
-        client = self.clients.get(config.provider)
-        if not client:
-            return LLMResponse(content="", error=f"Client not available for provider: {config.provider}")
-        
+    def _load_llm_config(self, config_path: str):
+        """Load per-task LLM config from JSON file (silently fallback to empty)."""
+        from pathlib import Path
+        import json
+        cfg_path = Path(config_path)
+        if not cfg_path.exists():
+            # try repo-relative path
+            alt = Path(__file__).parent / Path(config_path).name
+            if alt.exists():
+                cfg_path = alt
         try:
-            if config.provider == LLMProvider.OPENAI:
-                return await self._call_openai(client, config, prompt, context, system_prompt)
-            elif config.provider == LLMProvider.ANTHROPIC:
-                return await self._call_anthropic(client, config, prompt, context, system_prompt)
+            if cfg_path.exists():
+                with cfg_path.open("r", encoding="utf-8") as f:
+                    self.llm_config = json.load(f)
+            else:
+                self.llm_config = {}
+        except Exception:
+            # keep empty config on error but log for diagnostics if logger available
+            try:
+                import logging
+                logging.getLogger(__name__).exception("Failed to load llm_config.json, using empty config")
+            except Exception:
+                pass
+            self.llm_config = {}
+
+    def _get_task_config(self, task_type):
+        """Return config dict for TaskType (keys expected as 'quality_assessment', etc.)."""
+        try:
+            key = task_type.name.lower() if hasattr(task_type, "name") else str(task_type).lower()
+            return self.llm_config.get(key, {})
+        except Exception:
+            return {}
+
+    async def generate_response(self, *, task_type, prompt: str, system_prompt: str = None, **overrides):
+        """
+        Central entry point used by orchestrator.
+        This will merge per-task config from llm_config.json with any overrides.
+        """
+        task_cfg = self._get_task_config(task_type)
+
+        # Merge config (overrides take precedence)
+        model = overrides.pop("model", task_cfg.get("model"))
+        provider = overrides.pop("provider", task_cfg.get("provider", "openai"))
+        max_tokens = overrides.pop("max_tokens", task_cfg.get("max_tokens"))
+        temperature = overrides.pop("temperature", task_cfg.get("temperature"))
+        top_p = overrides.pop("top_p", task_cfg.get("top_p"))
+        frequency_penalty = overrides.pop("frequency_penalty", task_cfg.get("frequency_penalty"))
+        presence_penalty = overrides.pop("presence_penalty", task_cfg.get("presence_penalty"))
+
+        # Log chosen config for diagnostics
+        logger.info(f"LLM request for {task_type}: provider={provider} model={model} max_tokens={max_tokens}")
+
+        # Dispatch to provider-specific call (simplified - keep existing call semantics)
+        try:
+            if provider == "anthropic":
+                # ensure model exists / handle 404 fallback in caller
+                return await self._call_anthropic(model=model, prompt=prompt, system_prompt=system_prompt,
+                                                  max_tokens=max_tokens, temperature=temperature, **overrides)
+            else:
+                # default: openai
+                # NOTE: if your environment uses openai>=1.0.0 you must use the new API (OpenAI() client)
+                # either update usage here or pin openai==0.28
+                return await self._call_openai(model=model, prompt=prompt, system_prompt=system_prompt,
+                                               max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                                               frequency_penalty=frequency_penalty, presence_penalty=presence_penalty,
+                                               **overrides)
         except Exception as e:
-            logger.error(f"Error calling {config.provider.value}: {e}")
-            return LLMResponse(content="", error=str(e))
-    
-    async def _call_openai(self, client, config: LLMConfig, prompt: str, 
-                          context: Optional[str] = None, 
-                          system_prompt: Optional[str] = None) -> LLMResponse:
+            logger.error(f"LLM provider error ({provider}): {e}")
+            # 統一回傳錯誤物件以符合 existing caller expectations
+            class Err: pass
+            err = Err()
+            err.error = str(e)
+            err.content = None
+            err.model = model
+            err.usage = {}
+            return err
+
+    async def _call_openai(self, **kwargs):
         """調用 OpenAI API"""
         messages = []
         
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
+        if kwargs.get("system_prompt"):
+            messages.append({"role": "system", "content": kwargs["system_prompt"]})
         
-        if context:
-            messages.append({"role": "user", "content": f"Context:\n{context}\n\nTask:\n{prompt}"})
+        if kwargs.get("context"):
+            messages.append({"role": "user", "content": f"Context:\n{kwargs['context']}\n\nTask:\n{kwargs['prompt']}"})
         else:
-            messages.append({"role": "user", "content": prompt})
+            messages.append({"role": "user", "content": kwargs["prompt"]})
         
-        response = await asyncio.to_thread(
-            client.ChatCompletion.acreate,
-            model=config.model,
-            messages=messages,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-            top_p=config.top_p,
-            frequency_penalty=config.frequency_penalty,
-            presence_penalty=config.presence_penalty
-        )
+        # 使用新版 OpenAI API
+        client = openai.AsyncOpenAI()
+        
+        # 根據模型類型選擇正確的參數名稱
+        completion_params = {
+            "model": kwargs["model"],
+            "messages": messages
+        }
+        
+        # 對於較新的模型，使用 max_completion_tokens 並處理特殊參數限制
+        if "gpt-5" in kwargs["model"] or "gpt-4o" in kwargs["model"]:
+            completion_params["max_completion_tokens"] = kwargs["max_tokens"]
+            
+            # gpt-5-mini 模型不支持自定義 temperature，只支持默認值
+            if "gpt-5-mini" in kwargs["model"]:
+                # 不設置 temperature 參數，使用默認值
+                pass
+            else:
+                # 其他 gpt-5 模型可以設置 temperature
+                completion_params["temperature"] = kwargs["temperature"]
+        else:
+            completion_params["max_tokens"] = kwargs["max_tokens"]
+            completion_params["temperature"] = kwargs["temperature"]
+        
+        # 添加其他參數（如果模型支持）
+        if "gpt-5-mini" not in kwargs["model"]:
+            completion_params["top_p"] = kwargs["top_p"]
+            completion_params["frequency_penalty"] = kwargs["frequency_penalty"]
+            completion_params["presence_penalty"] = kwargs["presence_penalty"]
+        
+        response = await client.chat.completions.create(**completion_params)
         
         return LLMResponse(
             content=response.choices[0].message.content,
-            usage=response.usage.dict() if response.usage else None,
+            usage=response.usage.model_dump() if response.usage else None,
             model=response.model
         )
-    
-    async def _call_anthropic(self, client, config: LLMConfig, prompt: str,
-                             context: Optional[str] = None, 
-                             system_prompt: Optional[str] = None) -> LLMResponse:
+
+    async def _call_anthropic(self, **kwargs):
         """調用 Anthropic API"""
         full_prompt = ""
         
-        if system_prompt:
-            full_prompt += f"{system_prompt}\n\n"
+        if kwargs.get("system_prompt"):
+            full_prompt += f"{kwargs['system_prompt']}\n\n"
         
-        if context:
-            full_prompt += f"Context:\n{context}\n\n"
+        if kwargs.get("context"):
+            full_prompt += f"Context:\n{kwargs['context']}\n\n"
         
-        full_prompt += f"Task:\n{prompt}"
+        full_prompt += f"Task:\n{kwargs['prompt']}"
         
         response = await asyncio.to_thread(
-            client.messages.create,
-            model=config.model,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-            top_p=config.top_p,
+            anthropic.Anthropic.messages.create,
+            model=kwargs["model"],
+            max_tokens=kwargs["max_tokens"],
+            temperature=kwargs["temperature"],
+            top_p=kwargs["top_p"],
             messages=[{"role": "user", "content": full_prompt}]
         )
         

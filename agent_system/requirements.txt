@@ -35,7 +35,7 @@ flake8>=4.0.0
 mypy>=0.950
 
 # LLM API dependencies
-openai>=0.27.0
+openai>=1.0.0
 anthropic>=0.3.0
 
 # Optional: Database support

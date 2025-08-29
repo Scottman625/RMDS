@@ -570,9 +570,10 @@ class WorkflowOrchestrator:
         
         # 乾運行補丁
         dry_run_result = self.mcp_server.apply_patch({
-            "branch": "main",
+            "branch": "master",
             "unified_diff": sample_patch,
             "dry_run": True,
+            "commit": False,
             "task_id": task.task_id
         })
         
@@ -581,9 +582,10 @@ class WorkflowOrchestrator:
         
         # 實際應用補丁
         apply_result = self.mcp_server.apply_patch({
-            "branch": "main",
+            "branch": "master",
             "unified_diff": sample_patch,
             "dry_run": False,
+            "commit": False,  # 不提交到 git
             "task_id": task.task_id
         })
         
