@@ -158,8 +158,14 @@ async def show_workflow_details(workflow_id: str, repo_root: str = ".", policy_f
         print(f"開始時間: {status.get('start_time', 'N/A')}")
         print(f"結束時間: {status.get('end_time', 'N/A')}")
         
+        if status.get('user_task'):
+            print(f"用戶任務: {status['user_task']}")
+        
         if status.get('current_stage'):
             print(f"當前階段: {status['current_stage']}")
+        
+        if status.get('error_message'):
+            print(f"錯誤信息: {status['error_message']}")
         
         if status.get('stages'):
             print("\n📊 階段詳情:")
@@ -172,6 +178,38 @@ async def show_workflow_details(workflow_id: str, repo_root: str = ".", policy_f
                     for task in stage_data['tasks']:
                         task_status = task.get('status', 'unknown')
                         print(f"    - {task.get('agent_name', 'unknown')}: {task_status}")
+        
+        if status.get('artifacts'):
+            print("\n📦 工作流產物:")
+            artifacts = status['artifacts']
+            for key, value in artifacts.items():
+                if isinstance(value, dict):
+                    print(f"  {key}:")
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, str):
+                            if len(sub_value) > 200:
+                                print(f"    {sub_key}:")
+                                print(f"      {sub_value[:200]}...")
+                                print(f"      (內容長度: {len(sub_value)} 字符)")
+                            else:
+                                print(f"    {sub_key}: {sub_value}")
+                        else:
+                            print(f"    {sub_key}: {sub_value}")
+                elif isinstance(value, str):
+                    if len(value) > 200:
+                        print(f"  {key}:")
+                        print(f"    {value[:200]}...")
+                        print(f"    (內容長度: {len(value)} 字符)")
+                    else:
+                        print(f"  {key}: {value}")
+                else:
+                    print(f"  {key}: {value}")
+        
+        if status.get('summary'):
+            print("\n📈 工作流摘要:")
+            summary = status['summary']
+            for key, value in summary.items():
+                print(f"  {key}: {value}")
         
         print("=" * 80)
     
@@ -191,9 +229,9 @@ def main():
     args = parser.parse_args()
     
     if args.command == "run":
-        if not args.task:
-            print("❌ 運行工作流需要提供 --task 參數")
-            return
+        # if not args.task:
+        #     print("❌ 運行工作流需要提供 --task 參數")
+        #     return
         
         asyncio.run(run_workflow(args.task, args.repo_root, args.policy))
     

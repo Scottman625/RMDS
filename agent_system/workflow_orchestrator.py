@@ -66,10 +66,120 @@ class WorkflowOrchestrator:
         self.active_workflows: Dict[str, WorkflowContext] = {}
         self.workflow_history: List[Dict[str, Any]] = []
         
+        # 工作流數據文件路徑
+        self.workflow_data_file = Path("logs/workflow_data.json")
+        self.workflow_data_file.parent.mkdir(exist_ok=True)
+        
         # 定義工作流階段
         self.workflow_stages = self._define_workflow_stages()
         
+        # 加載歷史工作流數據
+        self._load_workflow_data()
+        
         logger.info("Workflow Orchestrator initialized with LLM client")
+    
+    def _load_workflow_data(self):
+        """加載工作流數據"""
+        try:
+            if self.workflow_data_file.exists():
+                with open(self.workflow_data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.workflow_history = data.get('workflow_history', [])
+                    logger.info(f"Loaded {len(self.workflow_history)} historical workflows")
+        except Exception as e:
+            logger.warning(f"Failed to load workflow data: {e}")
+            self.workflow_history = []
+    
+    def _save_workflow_data(self):
+        """保存工作流數據"""
+        try:
+            # 準備要保存的數據
+            data = {
+                'workflow_history': self.workflow_history,
+                'last_updated': datetime.now().isoformat()
+            }
+            
+            with open(self.workflow_data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+            
+            logger.info(f"Workflow data saved to {self.workflow_data_file}")
+        except Exception as e:
+            logger.error(f"Failed to save workflow data: {e}")
+    
+    def _serialize_workflow_context(self, context: WorkflowContext) -> Dict[str, Any]:
+        """序列化工作流上下文"""
+        return {
+            'workflow_id': context.workflow_id,
+            'user_task': context.user_task,
+            'project_root': str(context.project_root),
+            'current_stage': context.current_stage,
+            'stages': {
+                name: {
+                    'stage_name': stage.stage_name,
+                    'stage_description': stage.stage_description,
+                    'status': stage.status,
+                    'start_time': stage.start_time.isoformat() if stage.start_time else None,
+                    'end_time': stage.end_time.isoformat() if stage.end_time else None,
+                    'tasks': [
+                        {
+                            'task_id': task.task_id,
+                            'agent_name': task.agent_name,
+                            'agent_role': task.agent_role,
+                            'input_data': task.input_data,
+                            'status': task.status,
+                            'result': task.result,
+                            'error': task.error,
+                            'start_time': task.start_time.isoformat() if task.start_time else None,
+                            'end_time': task.end_time.isoformat() if task.end_time else None
+                        }
+                        for task in stage.tasks
+                    ]
+                }
+                for name, stage in context.stages.items()
+            },
+            'artifacts': context.artifacts,
+            'metadata': context.metadata
+        }
+    
+    def _deserialize_workflow_context(self, data: Dict[str, Any]) -> WorkflowContext:
+        """反序列化工作流上下文"""
+        # 重建階段
+        stages = {}
+        for name, stage_data in data['stages'].items():
+            tasks = []
+            for task_data in stage_data['tasks']:
+                task = WorkflowTask(
+                    task_id=task_data['task_id'],
+                    agent_name=task_data['agent_name'],
+                    agent_role=task_data['agent_role'],
+                    input_data=task_data['input_data'],
+                    status=task_data['status'],
+                    result=task_data.get('result'),
+                    error=task_data.get('error'),
+                    start_time=datetime.fromisoformat(task_data['start_time']) if task_data.get('start_time') else None,
+                    end_time=datetime.fromisoformat(task_data['end_time']) if task_data.get('end_time') else None
+                )
+                tasks.append(task)
+            
+            stage = WorkflowStage(
+                stage_name=stage_data['stage_name'],
+                stage_description=stage_data['stage_description'],
+                tasks=tasks,
+                status=stage_data['status'],
+                start_time=datetime.fromisoformat(stage_data['start_time']) if stage_data.get('start_time') else None,
+                end_time=datetime.fromisoformat(stage_data['end_time']) if stage_data.get('end_time') else None
+            )
+            stages[name] = stage
+        
+        return WorkflowContext(
+            workflow_id=data['workflow_id'],
+            user_task=data['user_task'],
+            project_root=Path(data['project_root']),
+            current_stage=data['current_stage'],
+            stages=stages,
+            artifacts=data['artifacts'],
+            metadata=data['metadata']
+        )
     
     def _define_workflow_stages(self) -> Dict[str, Dict[str, Any]]:
         """定義工作流階段"""
@@ -376,45 +486,30 @@ class WorkflowOrchestrator:
         if not result.success:
             return {"error": "Failed to list source files"}
         
-        # 構建 LLM 提示詞
-        prompt = f"""
-請分析以下用戶任務並生成標準化的需求規格：
-
-用戶任務：{user_task}
-
-相關源文件：{result.data.get("files", [])}
-
-請提供詳細的需求分析，包括：
-1. 需求背景和目標
-2. 功能需求列表
-3. 非功能需求（性能、安全、可維護性等）
-4. 涉及的技術模組和文件
-5. 風險評估
-6. 工作量估算
-"""
+        # 讀取 prompt.txt 文件內容
+        prompt_result = self.mcp_server.read_file({
+            "path": "agent_system/prompt.txt"
+        })
         
-        # 調用 LLM 進行需求分析
-        response = await self.llm_client.generate_response(
-            task_type=TaskType.REQUIREMENT_ANALYSIS,
-            prompt=prompt,
-            system_prompt=SYSTEM_PROMPTS[TaskType.REQUIREMENT_ANALYSIS]
-        )
+        if not prompt_result.success:
+            logger.error(f"Failed to read prompt.txt: {prompt_result.error}")
+            return {"error": f"Failed to read prompt.txt: {prompt_result.error}"}
         
-        if response.error:
-            logger.error(f"LLM error in requirement analysis: {response.error}")
-            return {"error": f"LLM analysis failed: {response.error}"}
+        prompt_content = prompt_result.data.get("content", "")
         
-        # 分析任務需求
+        # 分析任務需求 - 直接傳遞原始內容，讓任務分解器自行解析
         requirement_spec = {
             "spec_id": f"SPEC-{workflow_id}",
             "title": user_task,
             "description": user_task,
             "files_affected": result.data.get("files", []),
-            "estimated_complexity": "medium",
-            "priority": "normal",
-            "llm_analysis": response.content,
-            "model_used": response.model,
-            "tokens_used": response.usage
+            "estimated_complexity": "unknown",  # 讓任務分解器根據內容判斷
+            "priority": "unknown",  # 讓任務分解器根據內容判斷
+            "prompt_analysis": prompt_content,  # 完整的原始內容
+            "analysis_source": "prompt.txt",
+            "analysis_summary": prompt_content,  # 也將完整內容放入 summary，讓任務分解器有更多上下文
+            "raw_content_length": len(prompt_content),
+            "content_preview": prompt_content[:500] + "..." if len(prompt_content) > 500 else prompt_content
         }
         
         # 保存到工作流上下文
@@ -424,7 +519,8 @@ class WorkflowOrchestrator:
             "status": "completed",
             "requirement_spec": requirement_spec,
             "files_analyzed": len(result.data.get("files", [])),
-            "llm_response": response.content
+            "prompt_content": prompt_content,
+            "content_processing_method": "raw_content_passthrough"
         }
     
     async def _execute_task_decomposer(self, workflow_id: str, task: WorkflowTask) -> Dict[str, Any]:
@@ -432,23 +528,75 @@ class WorkflowOrchestrator:
         context = self.active_workflows[workflow_id]
         requirement_spec = context.artifacts.get("requirement_spec", {})
         
+        # 獲取 prompt.txt 的完整內容
+        prompt_content = requirement_spec.get("prompt_analysis", "")
+        raw_content_length = requirement_spec.get("raw_content_length", 0)
+        
+        # 使用 LLM 分析 prompt.txt 內容並生成任務計劃
+        task_plan = await self._analyze_prompt_content_with_llm(workflow_id, prompt_content, requirement_spec)
+        
+        context.artifacts["task_plan"] = task_plan
+        
+        return {
+            "status": "completed",
+            "task_plan": task_plan,
+            "total_tasks": len(task_plan["tasks"]),
+            "decomposition_method": "llm_based_analysis",
+            "content_analyzed": True,
+            "raw_content_length": raw_content_length
+        }
+    
+    async def _analyze_prompt_content_with_llm(self, workflow_id: str, prompt_content: str, requirement_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """使用 LLM 分析 prompt.txt 內容並生成任務計劃"""
+        
         # 構建 LLM 提示詞
         prompt = f"""
-請基於以下需求規格，將任務分解為具體的開發任務：
+請分析以下 prompt.txt 內容，並生成詳細的任務分解計劃：
 
-需求規格：{requirement_spec}
+原始內容：
+{prompt_content}
 
-請提供詳細的任務分解，包括：
-1. 任務列表和描述
-2. 每個任務的優先級和依賴關係
-3. 工作量估算
-4. 負責的 Agent 角色
-5. 預期的交付物
+請基於內容分析，生成結構化的任務計劃，包括：
 
-請以結構化的 JSON 格式回應。
+1. 內容分析：
+   - 需求類型（功能開發、修復、優化、重構等）
+   - 技術領域（記憶體安全、性能優化、架構設計等）
+   - 複雜度評估（低/中/高）
+   - 優先級評估（低/中/高）
+
+2. 任務分解：
+   - 將需求分解為具體的開發任務
+   - 每個任務包含：描述、負責的 Agent、優先級、工作量估算
+   - 識別任務間的依賴關係
+   - 評估風險和挑戰
+
+請以 JSON 格式回應，結構如下：
+{{
+    "content_analysis": {{
+        "requirement_type": "功能開發/修復/優化/重構",
+        "technical_domain": ["記憶體安全", "性能優化", "架構設計"],
+        "complexity": "低/中/高",
+        "priority": "低/中/高",
+        "estimated_total_hours": 數字,
+        "key_requirements": ["關鍵需求1", "關鍵需求2"]
+    }},
+    "tasks": [
+        {{
+            "task_id": "T1-{workflow_id}",
+            "description": "任務描述",
+            "agent": "cpp_developer/unit_test_generator/header_generator",
+            "priority": 1-3,
+            "estimated_hours": 數字,
+            "details": "詳細說明",
+            "dependencies": ["依賴任務ID"],
+            "risks": ["風險描述"]
+        }}
+    ],
+    "analysis_summary": "整體分析摘要"
+}}
 """
         
-        # 調用 LLM 進行任務分解
+        # 調用 LLM 進行分析
         response = await self.llm_client.generate_response(
             task_type=TaskType.TASK_DECOMPOSITION,
             prompt=prompt,
@@ -457,48 +605,421 @@ class WorkflowOrchestrator:
         
         if response.error:
             logger.error(f"LLM error in task decomposition: {response.error}")
-            return {"error": f"LLM decomposition failed: {response.error}"}
+            # 如果 LLM 失敗，使用預設任務計劃
+            return self._generate_fallback_task_plan(workflow_id, prompt_content, requirement_spec)
         
-        # 基於需求規格分解任務（如果 LLM 失敗，使用預設方案）
-        task_plan = {
-            "plan_id": f"PLAN-{workflow_id}",
-            "spec_id": requirement_spec.get("spec_id"),
-            "llm_decomposition": response.content,
-            "tasks": [
+        # 嘗試解析 LLM 回應
+        try:
+            # 嘗試從回應中提取 JSON
+            import json
+            import re
+            
+            # 尋找 JSON 內容
+            json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+            if json_match:
+                llm_analysis = json.loads(json_match.group())
+            else:
+                # 如果無法找到 JSON，嘗試解析整個回應
+                llm_analysis = json.loads(response.content)
+            
+            # 驗證和清理 LLM 分析結果
+            validated_analysis = self._validate_and_clean_llm_analysis(llm_analysis, workflow_id)
+            
+            # 構建任務計劃
+            task_plan = {
+                "plan_id": f"PLAN-{workflow_id}",
+                "spec_id": requirement_spec.get("spec_id"),
+                "decomposition_source": "llm_analysis",
+                "tasks": validated_analysis.get("tasks", []),
+                "content_analysis": validated_analysis.get("content_analysis", {}),
+                "analysis_basis": f"基於 LLM 分析的 {len(prompt_content)} 字符 prompt.txt 內容",
+                "prompt_content_length": len(prompt_content),
+                "content_preview": requirement_spec.get("content_preview", ""),
+                "estimated_total_hours": validated_analysis.get("content_analysis", {}).get("estimated_total_hours", 0),
+                "llm_response": response.content,
+                "model_used": response.model,
+                "tokens_used": response.usage,
+                "analysis_method": "llm_based_decomposition"
+            }
+            
+            return task_plan
+            
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            logger.error(f"Failed to parse LLM response: {e}")
+            logger.error(f"LLM response content: {response.content}")
+            # 如果解析失敗，使用預設任務計劃
+            return self._generate_fallback_task_plan(workflow_id, prompt_content, requirement_spec)
+    
+    def _validate_and_clean_llm_analysis(self, llm_analysis: Dict[str, Any], workflow_id: str) -> Dict[str, Any]:
+        """驗證和清理 LLM 分析結果"""
+        validated = {
+            "content_analysis": {},
+            "tasks": []
+        }
+        
+        # 驗證和清理內容分析
+        content_analysis = llm_analysis.get("content_analysis", {})
+        validated["content_analysis"] = {
+            "requirement_type": content_analysis.get("requirement_type", "功能開發"),
+            "technical_domain": content_analysis.get("technical_domain", []),
+            "complexity": content_analysis.get("complexity", "中"),
+            "priority": content_analysis.get("priority", "中"),
+            "estimated_total_hours": content_analysis.get("estimated_total_hours", 8),
+            "key_requirements": content_analysis.get("key_requirements", [])
+        }
+        
+        # 驗證和清理任務列表
+        tasks = llm_analysis.get("tasks", [])
+        task_counter = 1
+        
+        for task in tasks:
+            if isinstance(task, dict):
+                validated_task = {
+                    "task_id": task.get("task_id", f"T{task_counter}-{workflow_id}"),
+                    "description": task.get("description", "未指定任務"),
+                    "agent": task.get("agent", "cpp_developer"),
+                    "priority": min(max(task.get("priority", 2), 1), 3),  # 確保在 1-3 範圍內
+                    "estimated_hours": max(task.get("estimated_hours", 4), 1),  # 確保至少 1 小時
+                    "details": task.get("details", ""),
+                    "dependencies": task.get("dependencies", []),
+                    "risks": task.get("risks", [])
+                }
+                validated["tasks"].append(validated_task)
+                task_counter += 1
+        
+        # 如果沒有任務，添加預設任務
+        if not validated["tasks"]:
+            validated["tasks"] = [
                 {
                     "task_id": f"T1-{workflow_id}",
-                    "description": "分析現有代碼結構",
+                    "description": "核心功能實現",
                     "agent": "cpp_developer",
                     "priority": 1,
-                    "estimated_hours": 2
-                },
-                {
-                    "task_id": f"T2-{workflow_id}",
-                    "description": "實現核心功能",
-                    "agent": "cpp_developer",
-                    "priority": 1,
-                    "estimated_hours": 4
-                },
-                {
-                    "task_id": f"T3-{workflow_id}",
-                    "description": "生成對應測試",
-                    "agent": "unit_test_generator",
-                    "priority": 2,
-                    "estimated_hours": 2
+                    "estimated_hours": 6,
+                    "details": "實現 prompt.txt 中描述的核心功能",
+                    "dependencies": [],
+                    "risks": ["需求理解可能不完整"]
                 }
-            ],
-            "model_used": response.model,
-            "tokens_used": response.usage
-        }
+            ]
         
-        context.artifacts["task_plan"] = task_plan
+        return validated
+    
+    def _generate_fallback_task_plan(self, workflow_id: str, prompt_content: str, requirement_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """生成預設任務計劃（當 LLM 分析失敗時使用）"""
+        logger.warning(f"Using fallback task plan for workflow {workflow_id}")
+        
+        # 簡單的內容分析
+        content_length = len(prompt_content)
+        complexity = "高" if content_length > 2000 else "中" if content_length > 500 else "低"
+        
+        # 預設任務
+        tasks = [
+            {
+                "task_id": f"T1-{workflow_id}",
+                "description": "需求分析和架構設計",
+                "agent": "cpp_developer",
+                "priority": 1,
+                "estimated_hours": 4,
+                "details": "分析 prompt.txt 內容，設計系統架構",
+                "dependencies": [],
+                "risks": ["需求理解可能不完整"]
+            },
+            {
+                "task_id": f"T2-{workflow_id}",
+                "description": "核心功能實現",
+                "agent": "cpp_developer",
+                "priority": 1,
+                "estimated_hours": 6,
+                "details": "實現 prompt.txt 中描述的核心功能",
+                "dependencies": [f"T1-{workflow_id}"],
+                "risks": ["技術實現複雜度未知"]
+            },
+            {
+                "task_id": f"T3-{workflow_id}",
+                "description": "測試和驗證",
+                "agent": "unit_test_generator",
+                "priority": 2,
+                "estimated_hours": 3,
+                "details": "生成測試用例並驗證功能",
+                "dependencies": [f"T2-{workflow_id}"],
+                "risks": ["測試覆蓋率可能不足"]
+            }
+        ]
         
         return {
-            "status": "completed",
-            "task_plan": task_plan,
-            "total_tasks": len(task_plan["tasks"]),
-            "llm_response": response.content
+            "plan_id": f"PLAN-{workflow_id}",
+            "spec_id": requirement_spec.get("spec_id"),
+            "decomposition_source": "fallback_analysis",
+            "tasks": tasks,
+            "content_analysis": {
+                "requirement_type": "功能開發",
+                "technical_domain": ["通用開發"],
+                "complexity": complexity,
+                "priority": "中",
+                "estimated_total_hours": 13,
+                "key_requirements": ["實現 prompt.txt 描述的功能"]
+            },
+            "analysis_basis": f"預設分析（LLM 分析失敗）- {len(prompt_content)} 字符內容",
+            "prompt_content_length": len(prompt_content),
+            "content_preview": requirement_spec.get("content_preview", ""),
+            "estimated_total_hours": 13,
+            "analysis_method": "fallback_decomposition"
         }
+    
+    def _get_keyword_patterns(self) -> Dict[str, Dict[str, Any]]:
+        """獲取可配置的關鍵字模式"""
+        return {
+            "memory_security": {
+                "keywords": ["記憶體", "memory", "攻擊", "attack", "檢測", "detection", "安全", "security", "漏洞", "vulnerability"],
+                "task_template": {
+                    "description": "實現{category}相關功能",
+                    "agent": "cpp_developer",
+                    "priority": 1,
+                    "estimated_hours": 6,
+                    "details": "基於 prompt.txt 內容實現{category}功能"
+                }
+            },
+            "performance_optimization": {
+                "keywords": ["性能", "performance", "優化", "optimization", "效率", "efficiency", "速度", "speed", "快", "fast"],
+                "task_template": {
+                    "description": "性能優化和調優",
+                    "agent": "cpp_developer",
+                    "priority": 2,
+                    "estimated_hours": 4,
+                    "details": "根據 prompt.txt 要求進行性能優化"
+                }
+            },
+            "architecture_design": {
+                "keywords": ["架構", "architecture", "設計", "design", "結構", "structure", "模式", "pattern", "重構", "refactor"],
+                "task_template": {
+                    "description": "系統架構設計和重構",
+                    "agent": "cpp_developer",
+                    "priority": 1,
+                    "estimated_hours": 8,
+                    "details": "根據 prompt.txt 設計要求重構系統架構"
+                }
+            },
+            "real_time": {
+                "keywords": ["即時", "real-time", "實時", "realtime", "實時", "live", "即時", "instant", "實時", "realtime"],
+                "task_template": {
+                    "description": "即時處理系統實現",
+                    "agent": "cpp_developer",
+                    "priority": 1,
+                    "estimated_hours": 6,
+                    "details": "實現低延遲的即時處理機制"
+                }
+            },
+            "testing": {
+                "keywords": ["測試", "test", "驗證", "validation", "檢查", "check", "單元測試", "unit test", "集成測試", "integration test"],
+                "task_template": {
+                    "description": "生成單元測試",
+                    "agent": "unit_test_generator",
+                    "priority": 2,
+                    "estimated_hours": 3,
+                    "details": "為新功能生成完整的測試用例"
+                }
+            },
+            "documentation": {
+                "keywords": ["文檔", "documentation", "說明", "manual", "指南", "guide", "註釋", "comment", "文檔", "docs"],
+                "task_template": {
+                    "description": "更新文檔和註釋",
+                    "agent": "cpp_developer",
+                    "priority": 3,
+                    "estimated_hours": 2,
+                    "details": "根據 prompt.txt 要求更新相關文檔"
+                }
+            },
+            "database": {
+                "keywords": ["數據庫", "database", "db", "sql", "nosql", "存儲", "storage", "數據", "data"],
+                "task_template": {
+                    "description": "數據庫相關功能實現",
+                    "agent": "cpp_developer",
+                    "priority": 2,
+                    "estimated_hours": 5,
+                    "details": "實現數據庫相關功能"
+                }
+            },
+            "network": {
+                "keywords": ["網絡", "network", "socket", "tcp", "udp", "http", "https", "通信", "communication"],
+                "task_template": {
+                    "description": "網絡通信功能實現",
+                    "agent": "cpp_developer",
+                    "priority": 2,
+                    "estimated_hours": 5,
+                    "details": "實現網絡通信相關功能"
+                }
+            },
+            "ui_interface": {
+                "keywords": ["界面", "ui", "gui", "用戶界面", "user interface", "前端", "frontend", "顯示", "display"],
+                "task_template": {
+                    "description": "用戶界面實現",
+                    "agent": "cpp_developer",
+                    "priority": 2,
+                    "estimated_hours": 4,
+                    "details": "實現用戶界面相關功能"
+                }
+            },
+            "algorithm": {
+                "keywords": ["算法", "algorithm", "邏輯", "logic", "計算", "calculation", "處理", "process"],
+                "task_template": {
+                    "description": "核心算法實現",
+                    "agent": "cpp_developer",
+                    "priority": 1,
+                    "estimated_hours": 6,
+                    "details": "實現核心算法邏輯"
+                }
+            }
+        }
+    
+    def _analyze_content_with_patterns(self, content_lower: str, keyword_patterns: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        """使用動態模式分析內容"""
+        content_analysis = {}
+        
+        # 分析每個關鍵字模式
+        for pattern_name, pattern_config in keyword_patterns.items():
+            keywords = pattern_config["keywords"]
+            is_detected = any(keyword in content_lower for keyword in keywords)
+            content_analysis[f"is_{pattern_name}"] = is_detected
+            
+            # 記錄檢測到的具體關鍵字
+            detected_keywords = [kw for kw in keywords if kw in content_lower]
+            if detected_keywords:
+                content_analysis[f"detected_{pattern_name}_keywords"] = detected_keywords
+        
+        # 通用分析
+        content_analysis["has_specific_requirements"] = any(keyword in content_lower for keyword in [
+            "必須", "must", "需要", "need", "要求", "requirement", "實現", "implement", "添加", "add"
+        ])
+        
+        # 計算檢測到的模式數量
+        detected_patterns = sum(1 for key, value in content_analysis.items() 
+                              if key.startswith("is_") and value)
+        content_analysis["total_detected_patterns"] = detected_patterns
+        
+        return content_analysis
+    
+    def _generate_tasks_dynamically(self, workflow_id: str, content_analysis: Dict[str, Any], prompt_content: str) -> List[Dict[str, Any]]:
+        """動態生成任務列表"""
+        tasks = []
+        task_counter = 1
+        keyword_patterns = self._get_keyword_patterns()
+        
+        # 基礎任務 - 根據內容長度和複雜度
+        if content_analysis["content_length_category"] == "long":
+            tasks.append({
+                "task_id": f"T{task_counter}-{workflow_id}",
+                "description": "需求分析和架構設計",
+                "agent": "cpp_developer",
+                "priority": 1,
+                "estimated_hours": 4,
+                "details": "深入分析 prompt.txt 內容，設計系統架構和技術方案",
+                "content_based": True,
+                "generation_method": "content_length_based"
+            })
+            task_counter += 1
+        
+        # 根據檢測到的模式動態生成任務
+        for pattern_name, pattern_config in keyword_patterns.items():
+            if content_analysis.get(f"is_{pattern_name}", False):
+                task_template = pattern_config["task_template"]
+                
+                # 創建任務
+                task = {
+                    "task_id": f"T{task_counter}-{workflow_id}",
+                    "description": task_template["description"],
+                    "agent": task_template["agent"],
+                    "priority": task_template["priority"],
+                    "estimated_hours": task_template["estimated_hours"],
+                    "details": task_template["details"],
+                    "content_based": True,
+                    "generation_method": f"pattern_based_{pattern_name}",
+                    "detected_keywords": content_analysis.get(f"detected_{pattern_name}_keywords", [])
+                }
+                
+                tasks.append(task)
+                task_counter += 1
+        
+        # 通用任務
+        tasks.append({
+            "task_id": f"T{task_counter}-{workflow_id}",
+            "description": "核心功能實現",
+            "agent": "cpp_developer",
+            "priority": 1,
+            "estimated_hours": 6,
+            "details": "實現 prompt.txt 中描述的核心功能",
+            "content_based": True,
+            "generation_method": "generic_core_function"
+        })
+        task_counter += 1
+        
+        # 如果沒有檢測到特定需求，添加通用任務
+        if len(tasks) <= 2:  # 只有基礎任務
+            tasks.append({
+                "task_id": f"T{task_counter}-{workflow_id}",
+                "description": "通用功能實現",
+                "agent": "cpp_developer",
+                "priority": 1,
+                "estimated_hours": 4,
+                "details": "實現 prompt.txt 中描述的功能需求",
+                "content_based": True,
+                "generation_method": "fallback_generic"
+            })
+            task_counter += 1
+        
+        return tasks
+    
+    def _fix_diff_format(self, diff_content: str) -> str:
+        """修復 diff 格式，確保行數正確"""
+        try:
+            lines = diff_content.split('\n')
+            fixed_lines = []
+            
+            for i, line in enumerate(lines):
+                if line.startswith('@@'):
+                    # 修復 @@ 行
+                    # 格式應該是: @@ -old_start,old_count +new_start,new_count @@
+                    parts = line.split(' ')
+                    if len(parts) >= 3:
+                        old_part = parts[1]  # -old_start,old_count
+                        new_part = parts[2]  # +new_start,new_count
+                        
+                        # 確保格式正確
+                        if not old_part.startswith('-') or not new_part.startswith('+'):
+                            # 如果格式不正確，嘗試修復
+                            old_start = 1
+                            new_start = 1
+                            
+                            # 計算後續的行數變化
+                            added_lines = 0
+                            removed_lines = 0
+                            for j in range(i + 1, len(lines)):
+                                if lines[j].startswith('+') and not lines[j].startswith('++'):
+                                    added_lines += 1
+                                elif lines[j].startswith('-') and not lines[j].startswith('--'):
+                                    removed_lines += 1
+                                elif not lines[j].startswith(' ') and not lines[j].startswith('+') and not lines[j].startswith('-'):
+                                    break
+                            
+                            # 假設原始文件至少有 1 行
+                            old_count = max(1, removed_lines)
+                            new_count = max(1, added_lines)
+                            
+                            fixed_line = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+                            fixed_lines.append(fixed_line)
+                        else:
+                            fixed_lines.append(line)
+                    else:
+                        # 如果 @@ 行格式不完整，使用預設格式
+                        fixed_lines.append("@@ -1,1 +1,1 @@")
+                else:
+                    fixed_lines.append(line)
+            
+            return '\n'.join(fixed_lines)
+        except Exception as e:
+            logger.error(f"Error fixing diff format: {e}")
+            return diff_content
+    
+
     
     async def _execute_cpp_developer(self, workflow_id: str, task: WorkflowTask) -> Dict[str, Any]:
         """執行 C++ 開發者"""
@@ -586,9 +1107,13 @@ class WorkflowOrchestrator:
                     for line in lines:
                         if "*** Update File:" in line:
                             file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                            # 清理路徑，移除多餘的斜杠
+                            file_path = '/'.join(part for part in file_path.split('/') if part)
                             break
                         elif "*** Add File:" in line:
                             file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                            # 清理路徑，移除多餘的斜杠
+                            file_path = '/'.join(part for part in file_path.split('/') if part)
                             break
                     
                     # 尋找 diff 內容的開始
@@ -614,9 +1139,20 @@ class WorkflowOrchestrator:
                             added_lines = sum(1 for line in diff_lines[1:] if line.startswith('+') and not line.startswith('++'))
                             removed_lines = sum(1 for line in diff_lines[1:] if line.startswith('-') and not line.startswith('--'))
                             
-                            # 假設原始文件有 10 行（這是一個估計值）
-                            original_lines = 10
+                            # 讀取原始文件來獲取準確的行數
+                            original_file_result = self.mcp_server.read_file({"path": file_path})
+                            if original_file_result.success:
+                                original_content = original_file_result.data.get("content", "")
+                                original_lines = len(original_content.split('\n'))
+                            else:
+                                # 如果無法讀取原始文件，使用保守估計
+                                original_lines = max(1, len(diff_lines) - added_lines + removed_lines)
+                            
                             new_lines = original_lines + added_lines - removed_lines
+                            
+                            # 確保行數為正數
+                            original_lines = max(1, original_lines)
+                            new_lines = max(1, new_lines)
                             
                             diff_lines[0] = f"@@ -1,{original_lines} +1,{new_lines} @@"
                         
@@ -694,8 +1230,9 @@ class WorkflowOrchestrator:
                         # 格式1: *** Add File: src/test_detection_id.cpp
                         if line_stripped.startswith("*** Add File:") or line_stripped.startswith("*** Update File:"):
                             file_path = line_stripped.split(":", 1)[1].strip()
-                            # 統一使用正斜杠
+                            # 統一使用正斜杠並清理路徑
                             file_path = file_path.replace('\\', '/')
+                            file_path = '/'.join(part for part in file_path.split('/') if part)
                             content_start = i + 1
                             logger.info(f"[CPP_DEVELOPER] Found file path from '*** Add/Update File:' format: {file_path}")
                             break
@@ -705,6 +1242,8 @@ class WorkflowOrchestrator:
                             # 確保這是一個有效的文件路徑，不是其他內容
                             if '/' in line_stripped or '\\' in line_stripped:
                                 file_path = line_stripped.replace('\\', '/')
+                                # 清理路徑，移除多餘的斜杠
+                                file_path = '/'.join(part for part in file_path.split('/') if part)
                                 content_start = i + 1
                                 logger.info(f"[CPP_DEVELOPER] Found direct file path: {file_path}")
                                 break
@@ -765,7 +1304,25 @@ class WorkflowOrchestrator:
         
         if not dry_run_result.success:
             logger.warning(f"[CPP_DEVELOPER] Patch dry run failed: {dry_run_result.error}")
-            logger.info(f"[CPP_DEVELOPER] Falling back to direct file write method")
+            logger.info(f"[CPP_DEVELOPER] Attempting to fix diff format and retry...")
+            
+            # 嘗試修復 diff 格式
+            fixed_patch = self._fix_diff_format(sample_patch)
+            if fixed_patch != sample_patch:
+                logger.info(f"[CPP_DEVELOPER] Retrying with fixed diff format")
+                dry_run_result = self.mcp_server.apply_patch({
+                    "unified_diff": fixed_patch,
+                    "dry_run": True,
+                    "commit": False,
+                    "task_id": task.task_id
+                })
+                
+                if dry_run_result.success:
+                    sample_patch = fixed_patch
+                    logger.info(f"[CPP_DEVELOPER] Fixed diff format successful")
+                else:
+                    logger.warning(f"[CPP_DEVELOPER] Fixed diff format also failed: {dry_run_result.error}")
+                    logger.info(f"[CPP_DEVELOPER] Falling back to direct file write method")
             
             # 嘗試從 LLM 響應中提取文件內容並直接寫入
             if "*** Update File:" in response.content or "*** Add File:" in response.content:
@@ -776,9 +1333,13 @@ class WorkflowOrchestrator:
                 for line in lines:
                     if "*** Update File:" in line:
                         file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                        # 清理路徑，移除多餘的斜杠
+                        file_path = '/'.join(part for part in file_path.split('/') if part)
                         break
                     elif "*** Add File:" in line:
                         file_path = line.split(":", 1)[1].strip().replace('\\', '/')
+                        # 清理路徑，移除多餘的斜杠
+                        file_path = '/'.join(part for part in file_path.split('/') if part)
                         break
                 
                 if file_path:
@@ -1423,6 +1984,9 @@ class WorkflowOrchestrator:
             "final_report": final_report
         })
         
+        # 保存工作流數據
+        self._save_workflow_data()
+        
         # 清理
         del self.active_workflows[workflow_id]
     
@@ -1435,14 +1999,21 @@ class WorkflowOrchestrator:
         context.metadata["status"] = "failed"
         context.metadata["error_message"] = error_message
         
+        # 序列化完整的工作流上下文
+        workflow_data = self._serialize_workflow_context(context)
+        
         # 保存到歷史記錄
         self.workflow_history.append({
             "workflow_id": workflow_id,
             "status": "failed",
             "start_time": context.metadata["start_time"],
             "end_time": context.metadata["end_time"],
-            "error_message": error_message
+            "error_message": error_message,
+            "workflow_data": workflow_data
         })
+        
+        # 保存工作流數據
+        self._save_workflow_data()
         
         # 清理
         del self.active_workflows[workflow_id]
@@ -1476,18 +2047,43 @@ class WorkflowOrchestrator:
                 "status": "active",
                 "current_stage": context.current_stage,
                 "start_time": context.metadata["start_time"],
-                "stages": {name: asdict(stage) for name, stage in context.stages.items()}
+                "stages": {name: asdict(stage) for name, stage in context.stages.items()},
+                "artifacts": context.artifacts,
+                "user_task": context.user_task
             }
         
         # 檢查歷史記錄
         for record in self.workflow_history:
             if record["workflow_id"] == workflow_id:
-                return {
+                result = {
                     "workflow_id": workflow_id,
                     "status": record["status"],
                     "start_time": record["start_time"],
                     "end_time": record["end_time"]
                 }
+                
+                # 如果有最終報告，添加詳細信息
+                if "final_report" in record:
+                    result.update({
+                        "user_task": record["final_report"].get("user_task"),
+                        "artifacts": record["final_report"].get("artifacts", {}),
+                        "summary": record["final_report"].get("summary", {})
+                    })
+                
+                # 如果有完整的工作流數據（失敗的工作流）
+                if "workflow_data" in record:
+                    workflow_data = record["workflow_data"]
+                    result.update({
+                        "user_task": workflow_data.get("user_task"),
+                        "artifacts": workflow_data.get("artifacts", {}),
+                        "stages": workflow_data.get("stages", {})
+                    })
+                
+                # 如果有錯誤信息
+                if "error_message" in record:
+                    result["error_message"] = record["error_message"]
+                
+                return result
         
         return None
     

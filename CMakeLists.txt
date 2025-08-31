@@ -28,8 +28,12 @@ endif()
 # 包含目錄
 include_directories(include)
 
+# 啟用測試
+enable_testing()
+
 # 添加子目錄
 add_subdirectory(src)
+add_subdirectory(tests)
 
 # 安裝規則
 install(TARGETS memory_detection_engine real_detection_engine attack_simulator memory_monitor

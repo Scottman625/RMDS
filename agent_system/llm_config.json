@@ -2,7 +2,7 @@
   "requirement_analysis": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 4000,
+    "max_tokens": 6000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -12,7 +12,7 @@
   "task_decomposition": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 3000,
+    "max_tokens": 4500,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -22,7 +22,7 @@
   "code_generation": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 6000,
+    "max_tokens": 25000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -32,7 +32,7 @@
   "code_review": {
     "provider": "anthropic",
     "model": "claude-sonnet-4-20250514",
-    "max_tokens": 4000,
+    "max_tokens": 10000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -42,7 +42,7 @@
   "test_generation": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 4000,
+    "max_tokens": 8000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -52,7 +52,7 @@
   "quality_assessment": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 3000,
+    "max_tokens": 4500,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
@@ -62,7 +62,7 @@
   "static_analysis": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 2000,
+    "max_tokens": 3000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,

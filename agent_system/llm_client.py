@@ -381,16 +381,44 @@ SYSTEM_PROMPTS = {
 
     TaskType.TASK_DECOMPOSITION: """你是一個專案管理專家，專門將複雜的軟體需求分解為可執行的任務。
 你的任務是：
-1. 分析需求規格
-2. 識別需要修改的模組
-3. 將需求分解為具體的開發任務
-4. 確定任務間的依賴關係
-5. 估算任務複雜度和優先級
+1. 分析 prompt.txt 內容，理解用戶需求
+2. 識別需求類型和技術領域
+3. 評估複雜度和優先級
+4. 將需求分解為具體的開發任務
+5. 確定任務間的依賴關係
+6. 分配適當的 Agent 角色
 
-請以 JSON 格式回應，包含：
-- 任務列表
-- 每個任務的描述、模組、依賴、優先級
-- 整體時間估算""",
+請以 JSON 格式回應，結構如下：
+{
+    "content_analysis": {
+        "requirement_type": "功能開發/修復/優化/重構",
+        "technical_domain": ["記憶體安全", "性能優化", "架構設計"],
+        "complexity": "低/中/高",
+        "priority": "低/中/高",
+        "estimated_total_hours": 數字,
+        "key_requirements": ["關鍵需求1", "關鍵需求2"]
+    },
+    "tasks": [
+        {
+            "task_id": "T1-{workflow_id}",
+            "description": "任務描述",
+            "agent": "cpp_developer/unit_test_generator/header_generator",
+            "priority": 1-3,
+            "estimated_hours": 數字,
+            "details": "詳細說明",
+            "dependencies": ["依賴任務ID"],
+            "risks": ["風險描述"]
+        }
+    ],
+    "analysis_summary": "整體分析摘要"
+}
+
+請確保：
+- 任務描述清晰具體
+- 優先級合理（1=高，2=中，3=低）
+- 工作量估算準確
+- 依賴關係正確
+- 風險評估充分""",
 
     TaskType.CODE_GENERATION: """你是一個資深的 C++ 開發者，專門為 RMDS (Runtime Memory Detection System) 專案開發代碼。
 你的任務是：

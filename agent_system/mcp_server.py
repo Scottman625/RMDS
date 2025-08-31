@@ -250,7 +250,13 @@ class MCPServer:
             # 檢查讀取權限
             if operation == "read":
                 for pattern in self.policy.read_allow:
-                    if fnmatch.fnmatch(path_str, pattern):
+                    # 將 pattern 轉換成正規表示式以支持 ** 模式
+                    regex = (pattern
+                             .replace(".", r"\.")
+                             .replace("**/", r"(.*/)?")
+                             .replace("**", r".*")
+                             .replace("*", r"[^/]*"))
+                    if re.fullmatch(regex, path_str):
                         return True
                 logger.warning(f"Read access denied: {path_str}")
                 return False
@@ -276,7 +282,13 @@ class MCPServer:
                     logger.warning("Execute permissions not configured")
                     return False
                 for pattern in self.policy.execute_allow:
-                    if fnmatch.fnmatch(path_str, pattern):
+                    # 將 pattern 轉換成正規表示式以支持 ** 模式
+                    regex = (pattern
+                             .replace(".", r"\.")
+                             .replace("**/", r"(.*/)?")
+                             .replace("**", r".*")
+                             .replace("*", r"[^/]*"))
+                    if re.fullmatch(regex, path_str):
                         return True
                 logger.warning(f"Execute access denied: {path_str}")
                 return False
@@ -563,13 +575,15 @@ class MCPServer:
             original_lines = original_content.splitlines()
             new_lines = original_lines.copy()
             
-            # 簡單的 diff 應用邏輯
+            # 改進的 diff 應用邏輯
             diff_lines = diff_content.splitlines()
             line_number = 0
+            in_hunk = False
             
             for line in diff_lines:
                 if line.startswith('@@'):
                     # 解析 hunk 頭部
+                    in_hunk = True
                     try:
                         # 簡單的 hunk 解析
                         parts = line.split()
@@ -590,26 +604,29 @@ class MCPServer:
                         line_number = self._find_context_match_line(original_lines, diff_lines)
                         logger.info(f"[APPLY_DIFF] Context matching found line {line_number}")
                         continue
-                elif line.startswith('+') and not line.startswith('++'):
+                elif in_hunk and line.startswith('+') and not line.startswith('++'):
                     # 添加新行
                     if line_number < len(new_lines):
                         new_lines.insert(line_number, line[1:])
+                        logger.debug(f"[APPLY_DIFF] Added line at position {line_number}: {line[1:]}")
                     else:
                         new_lines.append(line[1:])
+                        logger.debug(f"[APPLY_DIFF] Added line at end: {line[1:]}")
                     line_number += 1
-                    logger.debug(f"[APPLY_DIFF] Added line at position {line_number-1}")
-                elif line.startswith('-') and not line.startswith('--'):
+                elif in_hunk and line.startswith('-') and not line.startswith('--'):
                     # 移除行
                     if line_number < len(new_lines):
-                        new_lines.pop(line_number)
-                        logger.debug(f"[APPLY_DIFF] Removed line at position {line_number}")
+                        removed_line = new_lines.pop(line_number)
+                        logger.debug(f"[APPLY_DIFF] Removed line at position {line_number}: {removed_line}")
                     # 不增加 line_number，因為我們移除了這一行
-                elif line.startswith(' '):
+                elif in_hunk and line.startswith(' '):
                     # 上下文行，跳過
                     line_number += 1
+                    logger.debug(f"[APPLY_DIFF] Skipped context line at position {line_number-1}")
                 elif not line.startswith('@'):
                     # 其他行，跳過
-                    line_number += 1
+                    if in_hunk:
+                        line_number += 1
             
             # 寫入修改後的文件
             final_content = '\n'.join(new_lines)

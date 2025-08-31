@@ -77,12 +77,6 @@ goto invalid_choice
 echo.
 echo %BLUE%=== Run New Workflow ===%RESET%
 echo.
-set /p task="Enter task description: "
-if "%task%"=="" (
-    echo %RED%Error: Task description cannot be empty%RESET%
-    pause
-    goto run_workflow
-)
 
 echo.
 echo %GREEN%Starting workflow...%RESET%

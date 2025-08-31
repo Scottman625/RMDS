@@ -5,6 +5,8 @@ add_library(memory_detection_engine STATIC
     memory_detection_utils.cpp
     memory_detection_veh.cpp
     detection_engine.cpp
+    event_handler.cpp
+    event_utils.cpp
     memory_monitor.cpp
     logger.cpp
     performance_monitor.cpp
@@ -129,4 +131,41 @@ if(WIN32)
         advapi32
         shell32
     )
-endif() 
+endif()
+
+# ===== 測試配置 =====
+
+# 創建測試可執行文件
+add_executable(test_detection_id
+    test_detection_id.cpp
+)
+
+# 設定測試可執行文件屬性
+set_target_properties(test_detection_id PROPERTIES
+    OUTPUT_NAME "test_detection_id"
+)
+
+# 包含目錄
+target_include_directories(test_detection_id PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(test_detection_id
+    memory_detection_engine
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(test_detection_id
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
+# 添加測試
+add_test(NAME test_detection_id COMMAND test_detection_id) 
