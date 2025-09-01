@@ -169,14 +169,25 @@ bool should_report_heap_issue(DWORD pid, uint64_t base) {
     return true;
 }
 
+void RealMemoryDetectionEngine::log_message(const std::string& level, const std::string& message) {
+    // 優先使用 logger_，沒有時退回到 stderr
+    if (logger_) {
+        try {
+            logger_->log(level, message);
+        } catch (...) {
+            std::cerr << "[" << level << "] " << message << std::endl;
+        }
+    } else {
+        std::cerr << "[" << level << "] " << message << std::endl;
+    }
+}
+
 /**
  * 真正的記憶體攻擊檢測引擎實現
  * 使用底層 Windows API 實現真實的記憶體監控和攻擊檢測
  */
-class DetectionEngineImpl : public RealMemoryDetectionEngine, public MemoryMonitor {
+class DetectionEngine : public RealMemoryDetectionEngine, public MemoryMonitor {
 private:
-    // 添加 monitor 成員
-    std::unique_ptr<MemoryMonitor> memory_monitor_;
     
     // 添加 EventHandler 成員
     std::unique_ptr<EventHandler> event_handler_;
@@ -2140,11 +2151,11 @@ private:
         
         // 將攻擊事件加入 EventHandler 進行處理
         if (event_handler_) {
-            Event ev;
+            Event::Type event_type = Event::Type::CUSTOM;
             // 將 AttackType 轉換為 Event::Type
             switch (type) {
                 case AttackType::HEAP_CORRUPTION:
-                    ev.type = Event::Type::HEAP_CORRUPTION;
+                    event_type = Event::Type::HEAP_CORRUPTION;
                     break;
                 case AttackType::SHELLCODE_INJECTION:
                 case AttackType::ROP_CHAIN:
@@ -2154,14 +2165,10 @@ private:
                 case AttackType::USE_AFTER_FREE:
                 case AttackType::MEMORY_CORRUPTION:
                 default:
-                    ev.type = Event::Type::CUSTOM;
+                    event_type = Event::Type::CUSTOM;
                     break;
             }
-            ev.process_id = target_process_id;
-            ev.address = address;
-            ev.size = 0; // 攻擊事件沒有特定大小
-            ev.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
+            Event ev = Event::make_event(event_type, target_process_id, address, 0);
             ev.meta = description + " (confidence: " + std::to_string(confidence) + ")";
             
             event_handler_->enqueue_event(ev);
@@ -2654,24 +2661,19 @@ public:
             config.suspicious_pattern_threshold = 5;
             config.log_file = "logs/memory_monitor.log";
             
-            memory_monitor_ = std::make_unique<MemoryMonitor>(config);
             
             // 初始化 EventHandler
-            event_handler_ = std::make_unique<EventHandler>();
+            event_handler_ = std::make_unique<EventHandler>(config);
             
             // 設置違規回調
-            memory_monitor_->set_violation_callback([this](AttackType type, uint64_t address, 
+            event_handler_->set_violation_callback([this](AttackType type, uint64_t address, 
                                                           const std::string& description, double confidence, DWORD process_id) {
                 this->report_attack(type, address, description, confidence, process_id);
             });
-            
-            // 啟動 monitor
-            if (!memory_monitor_->start()) {
-                log_warning("無法啟動記憶體監控器");
-            }
+        
             
             // 啟動 EventHandler 並設置依賴項
-            event_handler_->set_memory_monitor(memory_monitor_.get());
+            event_handler_->set_memory_monitor(event_handler_.get());
             event_handler_->set_detection_engine(this);
             log_important("starting event handler");
             event_handler_->start();
@@ -2687,7 +2689,7 @@ public:
             // process_monitor_thread_ = std::thread(&DetectionEngineImpl::process_monitor_loop, this);
 
             // 啟動指紋清理線程
-           fingerprint_cleaner_thread_ = std::thread(&DetectionEngineImpl::fingerprint_cleaner, this);
+           fingerprint_cleaner_thread_ = std::thread(&DetectionEngine::fingerprint_cleaner, this);
 
             log_important("Detection engine started successfully");
             return true;
@@ -2707,11 +2709,6 @@ public:
         try {
             // 設置停止標誌
             running_ = false;
-
-            // 停止 memory monitor
-            if (memory_monitor_) {
-                memory_monitor_->stop();
-            }
             
             // 停止 EventHandler
             if (event_handler_) {
@@ -4132,7 +4129,7 @@ int main() {
         log_file.close();
     }
     
-    DetectionEngineImpl engine;
+    DetectionEngine engine;
     
     if (!engine.start()) {
         std::cerr << "Failed to start detection engine" << std::endl;

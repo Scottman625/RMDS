@@ -163,19 +163,24 @@ using MemoryViolationCallback = std::function<void(AttackType, uint64_t, const s
  * 統一的記憶體監控器
  * 作為底層工具庫供 detection_engine 使用
  */
-class MemoryMonitor {
+class MemoryMonitor : public MagicHeader {
 
 protected:
     static const uint8_t* find_pattern(const uint8_t* haystack, size_t haystack_len, const char* needle, size_t needle_len);
 
 public:
     explicit MemoryMonitor(const MemoryMonitorConfig& config = MemoryMonitorConfig{});
-    ~MemoryMonitor();
+    virtual ~MemoryMonitor() {
+        invalidate(); // 標記為無效
+    }
 
     // 基本控制
     bool start();
     void stop();
     bool is_running() const;
+    
+    // 日誌函數
+    void log_message(const std::string& level, const std::string& message);
     
     // 回調設置
     void set_violation_callback(MemoryViolationCallback callback);
@@ -233,6 +238,7 @@ private:
     void monitor_loop();
     void process_monitor_loop();
     void memory_monitor_loop();
+    virtual void deep_scan_process(DWORD process_id); // 設為純虛函數
     
     // 內部掃描函數
     void scan_memory_region(const MemoryRegionInfo& region);
@@ -248,7 +254,6 @@ private:
     // 工具函數
     void report_violation(AttackType type, uint64_t address, 
                          const std::string& description, double confidence, DWORD process_id = 0);
-    void log_message(const std::string& level, const std::string& message);
     std::string get_timestamp() const;
     std::string format_address(uint64_t address) const;
     

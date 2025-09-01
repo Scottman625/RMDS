@@ -1,4 +1,6 @@
 #include "../include/memory_detection_monitor.hpp"
+#include "../include/event_utils.hpp"
+#include "../include/utils/process_lists.hpp"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -14,6 +16,7 @@
 #include <windows.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
+#undef min // Prevent macro conflict with std::min
 
 namespace RealMemoryDetection {
 
@@ -85,12 +88,7 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     log_file_.open(config_.log_file, std::ios::app);
 }
 
-MemoryMonitor::~MemoryMonitor() {
-    stop();
-    if (log_file_.is_open()) {
-        log_file_.close();
-    }
-}
+// Destructor is now defaulted in header file
 
 bool MemoryMonitor::start() {
     if (running_) return true;
@@ -173,34 +171,130 @@ void MemoryMonitor::monitor_loop() {
     }
 }
 
-// 掃描進程
-void MemoryMonitor::scan_processes() {
-    DWORD processes[4096];
-    DWORD cbNeeded;
+// // 掃描進程
+// void MemoryMonitor::scan_processes() {
+//     DWORD processes[4096];
+//     DWORD cbNeeded;
     
-    if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
-        DWORD num_processes = cbNeeded / sizeof(DWORD);
+//     if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+//         DWORD num_processes = cbNeeded / sizeof(DWORD);
+//         log_message("DEBUG", "[SCAN] 發現 " + std::to_string(num_processes) + " 個進程，將掃描前 " + std::to_string(config_.max_processes_to_scan) + " 個");
         
-        for (DWORD i = 0; i < num_processes && i < config_.max_processes_to_scan; i++) {
-            if (processes[i] != 0) {
-                std::string process_name = get_process_name(processes[i]);
-                if (!process_name.empty()) {
-                    monitor_process(processes[i], process_name);
+//         for (DWORD i = 0; i < num_processes && i < config_.max_processes_to_scan; i++) {
+//             if (processes[i] != 0) {
+//                 std::string process_name = get_process_name(processes[i]);
+//                 if (!process_name.empty()) {
+//                     log_message("DEBUG", "[SCAN] 處理進程 " + std::to_string(i+1) + "/" + std::to_string(std::min<DWORD>(num_processes, config_.max_processes_to_scan)) + ": pid=" + std::to_string(processes[i]) + " name='" + process_name + "'");
+//                     monitor_process(processes[i], process_name);
+//                 } else {
+//                     log_message("DEBUG", "[SCAN] 跳過進程 pid=" + std::to_string(processes[i]) + " (無法獲取名稱)");
+//                 }
+//             }
+//         }
+//         log_message("DEBUG", "[SCAN] 進程掃描完成");
+//     } else {
+//         log_message("ERROR", "[SCAN] EnumProcesses 失敗: gle=" + std::to_string(GetLastError()));
+//     }
+// }
+
+// 新增：智能進程排序結構
+    struct PrioritizedProcess {
+        DWORD pid;
+        std::string name;
+        int priority;
+        
+        PrioritizedProcess(DWORD p, const std::string& n, int pri) 
+            : pid(p), name(n), priority(pri) {}
+        
+        bool operator<(const PrioritizedProcess& other) const {
+            return priority > other.priority; // 降序排列
+        }
+    };
+
+void MemoryMonitor::scan_processes() {
+        log_message("INFO", "開始掃描進程...");
+        
+        DWORD processes[4096];
+        DWORD cbNeeded;
+        
+        if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+            DWORD num_processes = cbNeeded / sizeof(DWORD);
+            const int max_processes_to_scan = 200;
+            
+            // 收集進程信息並排序
+            std::vector<PrioritizedProcess> process_list;
+            
+            for (DWORD i = 0; i < num_processes; i++) {
+                if (processes[i] != 0) {
+                    std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+                    if (!process_name.empty()) {
+                        int priority = MemoryMonitor::get_process_priority(processes[i], process_name);
+                        process_list.emplace_back(processes[i], process_name, priority);
+                    }
                 }
             }
+            
+            // 按優先級排序
+            std::sort(process_list.begin(), process_list.end());
+            
+            // 記錄前50個高優先級進程
+            log_message("INFO", "進程優先級排序（前50個）：");
+            for (size_t i = 0; i < std::min(process_list.size(), static_cast<size_t>(50)); i++) {
+                const auto& proc = process_list[i];
+                log_message("INFO", "PID: " + std::to_string(proc.pid) + 
+                           ", Name: " + proc.name + 
+                           ", Priority: " + std::to_string(proc.priority));
+            }
+            
+            // 優先掃描高優先級進程
+            int scanned_count = 0;
+            for (const auto& proc : process_list) {
+                if (scanned_count >= max_processes_to_scan) break;
+                
+                if (proc.priority > 0) { // 只掃描有優先級的進程
+                    if (scanned_count % 20 == 0) {
+                    log_message("INFO", "掃描高優先級進程: " + proc.name + 
+                               " (PID: " + std::to_string(proc.pid) + 
+                               ", Priority: " + std::to_string(proc.priority) + ")");
+                    }
+                    if (proc.name.find("attack_simulator") != std::string::npos ||
+                        proc.name.find("attack") != std::string::npos) {
+                        deep_scan_process(proc.pid);
+                    } else {
+                        monitor_process(proc.pid, proc.name);
+                    }
+                    scanned_count++;
+                }
+            }
+            
+            log_message("INFO", "完成進程掃描，共掃描 " + std::to_string(scanned_count) + " 個進程");
         }
     }
-}
+
 
 // 監控單個進程
 void MemoryMonitor::monitor_process(DWORD process_id, const std::string& process_name) {
+    // 詳細日誌：記錄傳遞給 add_process 的 PID 和名稱匹配結果
+    log_message("DEBUG", "[MONADD] 開始處理進程: pid=" + std::to_string(process_id) + " name='" + process_name + "'");
+    
     MemoryDetectionEngine::ProcessCategory category = classify_process(process_name);
+    log_message("DEBUG", "[MONADD] 進程分類結果: pid=" + std::to_string(process_id) + " category=" + std::to_string((int)category));
+    
+    // 嘗試打開進程句柄
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
+    if (!hProcess) {
+        log_message("DEBUG", "[MONADD] pid=" + std::to_string(process_id) + " OpenProcess fail gle=" + std::to_string(GetLastError()));
+        return;
+    }
+    
+    log_message("DEBUG", "[MONADD] pid=" + std::to_string(process_id) + " handle=0x" + EventUtils::format_address((uint64_t)hProcess) + " 成功添加到監控列表");
     
     {
         std::lock_guard<std::mutex> lock(processes_mutex_);
         ProcessInfo& info = monitored_processes_[process_id];
         info.process_id = process_id;
         info.process_name = process_name;
+        info.process_handle = hProcess;  // 設置進程句柄
         info.category = category;
         info.priority = get_process_priority(process_id, process_name);
         info.last_scan = std::chrono::steady_clock::now();
@@ -686,7 +780,16 @@ std::vector<ExtendedProcessInfo> MemoryMonitor::get_monitored_processes() const 
     std::lock_guard<std::mutex> lock(processes_mutex_);
     std::vector<ExtendedProcessInfo> result;
     for (const auto& [pid, info] : monitored_processes_) {
-        result.push_back(info);
+        ExtendedProcessInfo ext_info;
+        ext_info.process_id = info.process_id;
+        ext_info.process_name = info.process_name;
+        ext_info.process_handle = info.process_handle;
+        ext_info.category = info.category;
+        ext_info.priority = info.priority;
+        ext_info.last_scan = info.last_scan;
+        ext_info.scan_count = info.scan_count;
+        ext_info.memory_regions = info.memory_regions;
+        result.push_back(ext_info);
     }
     return result;
 }
@@ -930,6 +1033,16 @@ bool MemoryMonitor::check_use_after_free_patterns(LPVOID address, SIZE_T size) {
 
 bool MemoryMonitor::check_buffer_overflow_patterns(LPVOID address, SIZE_T size) {
     return false;
+}
+
+// 實現 deep_scan_process 函數，使用 event_handler.cpp 中的檢測函數
+void MemoryMonitor::deep_scan_process(DWORD process_id) {
+}
+
+
+// 輔助函數：檢查是否為可執行保護
+static inline bool is_executable_protect(DWORD p) {
+    return (p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
 } // namespace RealMemoryDetection

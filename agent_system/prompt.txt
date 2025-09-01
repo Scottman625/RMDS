@@ -1,103 +1,259 @@
-只靠「進程(程序)建立/修改/刪除 的 hook」＋「每 10 秒跑一次 event loop（掃描/分析）」通常不夠，特別是你想抓的記憶體攻擊（寫→執行、程式碼注入、process hollowing、Ransomware 初期加密）很多在幾十毫秒～1 秒內就完成，等你 10 秒後才看，證據可能已消失、加密已跑一輪、短生命惡意程序已退出。
+了解：偵測器與攻擊模擬器是「不同的 EXE（不同進程）」。
 
-最好改成「混合式」：高風險事件即時（或 ≤100ms 微批次）處理＋低風險/穩定性檢查才放 10 秒甚至更久的批次。
+因此你目前的所有 VirtualQuery / ReadProcessMemory 只掃到「偵測器自己的位址空間」，永遠不會看到攻擊模擬器分配的那些 0x000001D0B7xx0000 區域。
 
-一、為什麼“只 10 秒循環”存在風險（白話）
-短命惡意行為：注入 → 執行 payload → 自刪，可能 <1 秒結束，你 10 秒後掃描根本看不到那個進程或記憶體區域。
-Write → Execute（修改權限）這類關鍵轉折：攻擊者會緊接著開 Thread 執行，延遲越久越難即時阻斷或取證。
-Ransomware 加密速度：現代勒索軟體幾秒可加密上百個檔案，你 10 秒後才察覺，損失面積暴增。
-轉瞬即逝的指標：被 hollow 的原始映像段、暫時性 RWX 區塊可能已被恢復或釋放。
-Process hollowing：CreateProcess(掛起) → Unmap 原映像 → Write payload → Resume，整串 <200~400ms。
-二、哪些東西“必須即時” vs “可以晚一點”（分類）
-P0 即時 / 微批（建議 ≤50~100ms 內判斷）
+要真正檢出攻擊，需要“跨進程”版本：用 VirtualQueryEx(targetHandle, …) + ReadProcessMemory(targetHandle, …)，並且針對「被監控的每個 PID」排程掃描事件。下面給你完整改造步驟與 Patch 範本。
 
-記憶體頁面權限轉成可執行（VirtualProtect / NtProtectVirtualMemory）
-遠端注入關鍵 API：WriteProcessMemory、CreateRemoteThread、NtQueueApcThread
-映像載入（ImageLoad）中的可疑模組（非簽章 / 非標準路徑）
-Process hollowing 關鍵步驟（Unmap / 重新寫入節段）
-高速大量檔案寫入（勒索前兆）
-驅動載入（Kernel 模式）
-P1 短延遲（0.5~2 秒）
+================================================== A. 根本問題回顧
+目前 MEMORY_REGION_SCAN 事件只帶「偵測器自己的 PID」，scan_memory_for_attacks() 只 VirtualQuery(本進程)。
+exec_page_tracker 以 base address 為 key，不含 PID。跨進程後會混淆。
+schedule_periodic_scan 沒為每個 monitored process 單獨建立掃描事件。
+check_executable_integrity / check_heap_region 仍用 get_process_handle(ev.process_id)，但事件的 process_id 都是偵測器本身，所以拿不到攻擊進程的頁面。
+你尚未把攻擊模擬器 PID 加入 memory_monitor_->monitored list（或加了但掃描流程沒用它）。
+================================================== B. 改造目標
+支援多進程：每個被監控 PID 定期發 MEMORY_REGION_SCAN。
+掃描函式改成 scan_process_memory(pid, hProcess)。
+exec page tracking 分 PID：key=(pid,pageBase)。
+Synthetic MEM_PROTECT_CHANGE 事件要綁定正確 pid。
+Integrity / Heap 檢查事件必須保留對應 pid。
+可以動態新增攻擊模擬器（例如藉由名稱 match 或手動指定 pid）。
+================================================== C. 新 / 調整資料結構
+ExecKey:
+struct ExecKey {
+DWORD pid;
+uint64_t base;
+bool operator==(const ExecKey& o) const noexcept {
+return pid==o.pid && base==o.base;
+}
+};
+struct ExecKeyHash {
+size_t operator()(ExecKey const& k) const noexcept {
+return ((size_t)k.pid * 1315423911u) ^ (size_t)k.base;
+}
+};
+unordered_map<ExecKey, ExecPageInfo, ExecKeyHash> exec_pages_;
 
-頁面熵/ gadget 密度補充計算（對已標記的可疑頁）
-模組哈希二次驗證（初步標記後排隊）
-異常行為累積評分（聚合多事件）
-P2 例行（10 秒～數分鐘）
+SuspiciousKey 你已有 (pid,page)，保持一致。
 
-全系統進程清單對齊 (inventory)
-穩定系統模組完整性（Hash baseline）
-累積統計輸出（報表、趨勢）
-P3 背景（幾十分鐘～小時）
+Event 增加 process_handle（你已存在）。確保 MEMORY_REGION_SCAN 事件填寫對應 handle。
 
-歷史行為模型再訓練
-長期白名單/黑名單調整
-→ 你的 10 秒 event loop 只適合 P2/P3，不應承擔 P0。
+================================================== D. 事件流程變更
+schedule_periodic_scan():
 
-三、混合式架構建議（簡化版）
-Hook / ETW / eBPF 層（即時收集）
-把高風險事件放進 lock-free ring buffer。
-Fast Analyzer Thread（高頻 20~100Hz 或事件觸發）
-每次批量取出最多 N 筆（例如 512）
-做最輕量規則：Write→Exec Gap、跨程序寫入、權限翻轉次數、路徑可疑度
-產生“可疑頁/可疑程序”清單（score 基礎版）
-Deferred Analyzer（低頻，例如每 1~2 秒）
-對得分高的頁面做熵 / gadget / snapshot
-Periodic Sweeper（10 秒或更久）
-清理過期狀態、重新計 baseline、輸出統計
-Adaptive Escalation
-若單位時間可疑比率激增（例如 過去 30 秒平均值的 3 倍）→ 暫時提高 Fast Analyzer 觸發頻率，並縮小批次延遲
-四、如果堅持 10 秒才分析會出現的幾個具體失誤案例
-進程 A 在 0.2 秒內被 hollow，惡意 payload 執行並開後門 Thread，0.8 秒後結束；第 10 秒掃描時：只看到正常父進程，缺少中途記錄。
-攻擊者分散式注入：每 2 秒向不同進程寫小段 shellcode 並立即用 QueueUserAPC 執行；你只看到零星執行痕跡，不知來源。
-Ransomware 快速加密第一批“高價值”目錄（文件伺服器映射），你在第 10 秒才統計出“異常大量寫入”，檔案已損失。
-五、實際落地：延遲 vs 負載的折衷技巧
-微批（mini-batch）：不是每個事件都同步分析，而是每 50ms 或 “事件數 >= X” 就處理一次。（降低上下文切換）
-兩階段評分：第一階（極輕）只用計數/時間差；第二階（較重）才算熵/指令特徵。
-限速（rate limiting）：同一頁在“觀察窗口”內不重複重算熵。
-階梯降頻：系統閒置時提高檢查深度，忙碌時只保留 P0。
-動態調整 loop 間隔：interval = clamp(base * (normal_load / current_load), min, max)。
-六、如何量化“現在的頻率夠不夠”？
-收集這些指標（作決策的量化基線）：
+不再用 GetCurrentProcessId()。
+迴圈 memory_monitor_->get_monitored_processes()。
+每個產生 Event::MEMORY_REGION_SCAN，填 ev.process_id = p.process_id, ev.process_handle = p.process_handle。
+handle_memory_region_scan_event(ev): 呼叫 scan_process_memory(ev.process_id, ev.process_handle)。
 
-P0 事件平均/最大延遲（事件產生→第一層規則評分完成）
-短生命程序占比（生命週期 < 2 秒 的程序數 / 總程序數）
-可疑鏈（例如 Write→Exec）中 Write 與 Exec 事件時間差分佈
-每秒事件量峰值（P99）與 CPU 使用率
-偵測命中後到通知時間（end-to-end detection latency）
-目標示例：
-P0 平均延遲 <100ms，P95 <300ms
-短生命程序抓取率 >90%
-Ransomware 模擬：前 100 個檔案加密內偵測率 >80%
-如果你現在 10 秒模型無法達到上面任何一項，就需提升頻率。
+scan_process_memory():
 
-七、簡化決策表（挑幾個問題自問）
-Q1：你關心的攻擊是否會在 <5 秒內完成主要破壞？
+用 VirtualQueryEx(hProcess, address, &mbi,…)。
+產生 EXECUTABLE_INTEGRITY_CHECK / HEAP_REGION_CHECK 時保留 ev.process_id。
+exec_page_tracker 使用 ExecKey(pid, base)。
+Synthetic MEM_PROTECT_CHANGE 事件：process_id = 目標 pid。
 
-→ 是：10 秒不夠。
+check_heap_region / check_executable_integrity：不要用 GetCurrentProcess() 讀自己，要用對應 pid 的 handle（從 get_process_handle(pid) 取得）。
 
-Q2：是否需要證據（快照 / 記憶體片段）供取證？且這些片段可能快速釋放？
+==================================================
+E. 重點 Patch 範例 (節選 Diff 形式)
+(請根據你實際檔案調整；此為示意，非完整檔案)
 
-→ 是：需要即時或微批。
+----- 新增：exec key 定義（檔案頂部 namespace 內） -----
+struct ExecKey {
+DWORD pid;
+uint64_t base;
+bool operator==(const ExecKey& o) const noexcept {
+return pid==o.pid && base==o.base;
+}
+};
+struct ExecKeyHash {
+size_t operator()(ExecKey const& k) const noexcept {
+return ((size_t)k.pid * 1315423911u) ^ (size_t)k.base;
+}
+};
 
-Q3：CPU 還有 3~5% 可分配嗎？
+std::unordered_map<ExecKey, ExecPageInfo, ExecKeyHash> exec_pages_;  // 取代原 exec_pages_
 
-→ 有：可以支援更高頻事件處理。
+----- 修改 schedule_periodic_scan() -----
+void EventHandler::schedule_periodic_scan() {
+if (!memory_monitor_) return;
+auto processes = memory_monitor_->get_monitored_processes();
+for (auto const& p : processes) {
+if (p.process_handle == INVALID_HANDLE_VALUE) continue;
+Event ev;
+ev.type = Event::Type::MEMORY_REGION_SCAN;
+ev.process_id = p.process_id;
+ev.process_handle = p.process_handle;
+ev.timestamp_ms = EventUtils::now_ms();
+ev.meta = "Periodic memory scan pid=" + std::to_string(p.process_id);
+ev.priority = EventPriority::NORMAL;
+enqueue_event(ev);
+}
+}
 
-Q4：攻擊者可能獲得 Kernel / 高權限並試圖清痕跡？
+----- 修改 handle_memory_region_scan_event -----
+void EventHandler::handle_memory_region_scan_event(const Event& ev) {
+if (ev.process_handle && ev.process_handle != INVALID_HANDLE_VALUE) {
+scan_process_memory(ev.process_id, ev.process_handle);
+}
+}
 
-→ 是：延遲越短，越不容易被提前抹除。
+----- 新增 scan_process_memory (取代 scan_memory_for_attacks 的用途) -----
+void EventHandler::scan_process_memory(DWORD pid, HANDLE hProcess) {
+MemoryDetectionEngine::log_message("DEBUG",
+"*** SCAN_PROCESS_MEMORY pid=" + std::to_string(pid) + " ***");
+LPVOID address = 0;
+MEMORY_BASIC_INFORMATION mbi;
+int scanned = 0;
+while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) &&
+(max_regions_to_scan_ <=0 || scanned < max_regions_to_scan_)) {
 
-八、建議的最小“升級版”頻率配置（務實方案）
-Fast Event Batch：每 50ms 或 >=256 筆事件就跑一次（取二者較早）
-Deferred Heavy：每 1 秒處理“可疑列表”裡前 N 個（N 依 CPU，例：200）
-Periodic Inventory：每 15 秒（或 30 秒）全量列舉 + Hash 核心模組
-Background Deep Integrity：每 10~30 分鐘（視系統壓力）
-如果你的事件量很低，可以把 Fast Event Batch 拉到 100~200ms；千萬不要直接跳 10 秒。
+複製
+    if (mbi.State == MEM_COMMIT) {
+        bool is_exec = is_executable_protect(mbi.Protect);
 
-九、怕實作複雜？可以這樣先做 MVP
-事件 Hook → 放 ring buffer
-一個 thread：while(true) { wait( up to 50ms or buffer >=128 ); pull batch; run lightweight rules; append suspicious list }
-另一 thread：每 1 秒從 suspicious list 抽前 100 個頁面算熵 / snapshot（超過的留到下次）
-每 20 秒：做一次全系統進程/模組校對
-很快、清晰、容易量化延遲。
+        // exec integrity
+        if (is_exec) {
+            Event ex;
+            ex.type = Event::Type::EXECUTABLE_INTEGRITY_CHECK;
+            ex.process_id = pid;
+            ex.process_handle = hProcess;
+            ex.address = (uint64_t)mbi.BaseAddress;
+            ex.size = mbi.RegionSize;
+            ex.timestamp_ms = EventUtils::now_ms();
+            ex.meta = "Exec integrity scan";
+            enqueue_event(ex);
+        }
 
+        // heap-like
+        if ( (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) &&
+             (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+            Event hv;
+            hv.type = Event::Type::HEAP_REGION_CHECK;
+            hv.process_id = pid;
+            hv.process_handle = hProcess;
+            hv.address = (uint64_t)mbi.BaseAddress;
+            hv.size = mbi.RegionSize;
+            hv.timestamp_ms = EventUtils::now_ms();
+            hv.meta = "Heap region scan";
+            enqueue_event(hv);
+        }
+
+        // exec page tracker
+        ExecKey ek{pid,(uint64_t)mbi.BaseAddress};
+        {
+            std::lock_guard<std::mutex> lk(exec_pages_mutex_);
+            auto& info = exec_pages_[ek];
+            bool was_init = (info.first_seen_ts != 0);
+            if (!was_init) {
+                info.first_seen_ts = EventUtils::now_ms();
+                info.last_protect = mbi.Protect;
+                info.seen_exec = is_exec;
+                if (is_exec && mbi.Type == MEM_PRIVATE) {
+                    Event sp;
+                    sp.type = Event::Type::MEM_PROTECT_CHANGE;
+                    sp.process_id = pid;
+                    sp.process_handle = hProcess;
+                    sp.address = (uint64_t)mbi.BaseAddress;
+                    sp.size = mbi.RegionSize;
+                    sp.timestamp_ms = info.first_seen_ts;
+                    sp.meta = "Synthetic EXEC(initial)";
+                    sp.priority = EventPriority::HIGH;
+                    sp.source = EventSource::DERIVED;
+                    enqueue_event(sp);
+                }
+            } else {
+                if (info.last_protect != mbi.Protect) {
+                    bool was_exec = is_executable_protect(info.last_protect);
+                    if (!was_exec && is_exec) {
+                        Event sp;
+                        sp.type = Event::Type::MEM_PROTECT_CHANGE;
+                        sp.process_id = pid;
+                        sp.process_handle = hProcess;
+                        sp.address = (uint64_t)mbi.BaseAddress;
+                        sp.size = mbi.RegionSize;
+                        sp.timestamp_ms = EventUtils::now_ms();
+                        sp.meta = "RW->EXEC transition";
+                        sp.priority = EventPriority::HIGH;
+                        sp.source = EventSource::DERIVED;
+                        enqueue_event(sp);
+                    }
+                    info.last_protect = mbi.Protect;
+                }
+            }
+        }
+        scanned++;
+    }
+    address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+    if (address < mbi.BaseAddress) break;
+}
+MemoryDetectionEngine::log_message("DEBUG",
+    "*** SCAN_PROCESS_MEMORY pid=" + std::to_string(pid) + " regions=" + std::to_string(scanned) + " ***");
+}
+
+----- 在 analyze_event_batch / dispatch 時保留 process_handle -----
+(建立事件時記得帶 process_handle，check_executable_integrity / heap 改用 pid 取 handle)
+
+----- 修改 check_executable_integrity -----
+HANDLE hProcess = get_process_handle(pid); // 仍可復用快取
+if (hProcess == INVALID_HANDLE_VALUE) {
+MemoryDetectionEngine::log_message("DEBUG","[INTEGRITY] invalid handle pid="+std::to_string(pid));
+return;
+}
+if (!ReadProcessMemory(hProcess, base_address, buffer.data(), buffer.size(), &bytes_read)) {
+MemoryDetectionEngine::log_message("DEBUG","[INTEGRITY] RPM fail pid="+std::to_string(pid)+" gle="+std::to_string(GetLastError()));
+return;
+}
+
+----- 修改 check_heap_region -----
+HANDLE hProcess = get_process_handle(GetCurrentProcessId()); // 改
+→ 應改成：接受 pid 參數，或在事件中帶 pid。同樣讀 hProcess 而不是 GetCurrentProcess()。
+
+(建議新增參數：check_heap_region(DWORD pid, LPVOID base_address, SIZE_T region_size))
+
+----- 呼叫處 (HEAP_REGION_CHECK):
+handle_heap_region_check_event(ev){
+check_heap_region(ev.process_id, (LPVOID)ev.address, ev.size);
+}
+
+================================================== F. memory_monitor 加入攻擊模擬器
+枚舉進程，用 Toolhelp32 或 EnumProcesses。
+比對 exe 名稱（例：attack_simulator.exe）。
+為它建立 ProcessInfo{pid, OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ, FALSE,pid), category=ATTACK_SIMULATOR}。
+放進 internal vector。
+get_monitored_processes() 回傳時包含它。
+若你已經有 MemoryMonitor 類別，只需確保它真的包含那個 PID，啟動後 log 一次列表：
+for(auto&p:memory_monitor_->get_monitored_processes()){
+MemoryDetectionEngine::log_message("DEBUG","[MON] pid="+std::to_string(p.process_id)+" handle="+EventUtils::format_address((uint64_t)p.process_handle));
+}
+
+================================================== G. 測試流程建議
+啟動偵測器：看 log 是否列出 [MON] pid=攻擊模擬器PID。
+等第一輪 schedule_periodic_scan → 應看到對該 PID 的 MEMORY_REGION_SCAN dispatch。
+出現：*** SCAN_PROCESS_MEMORY pid=xxxx ***
+產生 MEM_PROTECT_CHANGE / EXECUTABLE_INTEGRITY_CHECK 自然帶 pid=xxxx。
+之後啟動攻擊功能（ROP、Realistic），再次掃描應出現 Synthetic 或 RW->EXEC transition（如果你的掃描頻率覆蓋到 RW 階段）。
+IntegrityCheck log 中 ret_cnt / pop_cnt > 閾值 → 產生 ROP/Shellcode Indicators。
+如果掃描頻率太低導致總是只看到“初始就是 EXEC”，仍然可以：
+
+對 VirtualAlloc 掛 Hook（或在攻擊模擬器加入共享 channel，將新分配地址傳到偵測器 → 偵測器針對那些地址優先 VirtualQueryEx）。
+或縮短 scan_interval_，僅對 ATTACK_SIMULATOR 類別使用更高頻率。
+================================================== H. 取得更即時的 RW->RX 轉換（進階）
+(不一定現在做)
+
+DLL 注入攻擊模擬器，Hook VirtualProtect / VirtualAlloc / WriteProcessMemory → 將事件 (pid, base, size, oldProtect,newProtect) 經 NamedPipe/共享記憶體傳回偵測器。
+偵測器收到後立即建立 MEM_PROTECT_CHANGE + EXECUTABLE_INTEGRITY_CHECK 而不用等掃描。
+替代方案：ETW (Microsoft-Windows-Threat-Intelligence 或 VirtualAlloc Trace)，或內核驅動。
+================================================== I. 常見陷阱
+權限不足：必須以與目標同位元數 (64-bit -> 64-bit)；32-bit 偵測器讀 64-bit 進程會失敗。
+句柄失效：進程結束後 cache 未清理 → 你已有 cleanup，但要記得在 get_process_handle 補 failing log。
+Region 巨大 (MEM_IMAGE) → 讀取 4KB / 8KB 片段即可，不要整段讀。
+讀失敗 GetLastError = 299 (ERROR_PARTIAL_COPY) → 對含 guard/NOACCESS 子頁面要縮減讀取長度。
+max_regions_to_scan_ 過小 → 高位址區域永遠不到。建議跨進程模式下預設 -1（不限制）或分階段（先前 4096 region，然後記錄未掃描游標）。
+================================================== J. 建議優先動作清單（你現在要做的）
+實作 scan_process_memory() + schedule_periodic_scan 多 PID 改造。
+改 exec_pages_ 為 (pid,base) key。
+修改所有 VirtualQuery → VirtualQueryEx(hProcess, …)。
+修改 check_heap_region / integrity 讀 remote handle。
+確認攻擊 PID 被列入 memory_monitor。
+測試並貼出第一輪含 [MON] / SCAN_PROCESS_MEMORY / IntegrityCheck 的 log（若還有問題再細化）。

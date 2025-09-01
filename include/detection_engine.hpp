@@ -12,19 +12,20 @@
 #include "memory_detection_utils.hpp"
 #include "memory_detection_veh.hpp"
 #include "memory_detection_monitor.hpp"
+#include "memory_detection_types.hpp"
 
 namespace RealMemoryDetection {
 
 // 真實記憶體攻擊檢測引擎類
-class RealMemoryDetectionEngine {
+class RealMemoryDetectionEngine : public MagicHeader {
 public:
     using AttackCallback = std::function<void(const DetectionResult&)>;
     
     // 構造函數
-    explicit RealMemoryDetectionEngine(const EngineConfig& config = EngineConfig{});
+    RealMemoryDetectionEngine(const EngineConfig& config = EngineConfig{});
     
     // 析構函數
-    virtual ~RealMemoryDetectionEngine();
+    ~RealMemoryDetectionEngine();
     
     // 啟動引擎
     virtual bool start();
@@ -77,6 +78,9 @@ public:
     
     // 更新配置
     void update_config(const EngineConfig& config);
+    
+    // 日誌記錄方法（供 EventHandler 使用）
+    void log_message(const std::string& level, const std::string& message);
 
 private:
     // 檢測迴圈
@@ -140,4 +144,4 @@ private:
 // 工廠函數
 std::unique_ptr<RealMemoryDetectionEngine> create_engine(const EngineConfig& config = EngineConfig{});
 
-} // namespace RealMemoryDetection 
+} // namespace RealMemoryDetection

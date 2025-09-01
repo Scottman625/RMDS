@@ -7,10 +7,12 @@ add_library(memory_detection_engine STATIC
     detection_engine.cpp
     event_handler.cpp
     event_utils.cpp
+    event_normalizer.cpp
     memory_monitor.cpp
     logger.cpp
     performance_monitor.cpp
     process_lists.cpp
+    crash_handler.cpp
 )
 
 # 設定目標屬性
@@ -88,6 +90,38 @@ target_include_directories(attack_simulator PRIVATE
 # 鏈接Windows API庫
 if(WIN32)
     target_link_libraries(attack_simulator
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
+# 創建崩潰測試程式
+add_executable(crash_test
+    crash_test.cpp
+)
+
+# 設定崩潰測試程式屬性
+set_target_properties(crash_test PROPERTIES
+    OUTPUT_NAME "crash_test"
+)
+
+# 包含目錄
+target_include_directories(crash_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(crash_test
+    memory_detection_engine
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(crash_test
         kernel32
         user32
         psapi

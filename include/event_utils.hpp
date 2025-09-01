@@ -15,6 +15,7 @@ namespace RealMemoryDetection {
 // 事件工具函數類別
 class EventUtils {
 public:
+    static void log_message(const char* level, const char* message);
     // 字串寫入操作檢測
     static void detect_string_write_operations(DWORD process_id, HANDLE hProcess);
     
@@ -66,6 +67,7 @@ public:
     // 時間相關工具
     static std::string format_timestamp(uint64_t timestamp_ms);
     static uint64_t get_current_timestamp_ms();
+    static uint64_t now_ms() { return get_current_timestamp_ms(); } // 別名函數
     
     // 統計和分析
     static void update_detection_statistics(const std::string& detection_type, double confidence);

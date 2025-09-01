@@ -102,7 +102,7 @@ bool allocate_rw_block(RWXBlock& blk, size_t sz) {
     blk.base = VirtualAlloc(nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     blk.size = sz;
     if(!blk.base) {
-        log_message("ERROR", "VirtualAlloc RW 失敗");
+        log_message("ERROR", "VirtualAlloc RW failed");
         return false;
     }
     std::string m = std::string("Allocated RW block @ ")+fmt_addr(blk.base)+
@@ -116,7 +116,7 @@ bool write_stage(const RWXBlock& blk, const std::vector<uint8_t>& buf, size_t of
     SIZE_T written = 0;
     if(!WriteProcessMemory(GetCurrentProcess(),
         (uint8_t*)blk.base + offset, buf.data(), buf.size(), &written) || written != buf.size()) {
-        log_message("ERROR", "WriteProcessMemory 失敗 (stage)");
+        log_message("ERROR", "WriteProcessMemory failed (stage)");
         return false;
     }
     std::string m = std::string("WriteProcessMemory block=")+fmt_addr(blk.base)+
@@ -129,13 +129,13 @@ bool protect_exec(RWXBlock& blk) {
 #if ASM_PROTECT_EXEC_MODE==0
     DWORD oldProt;
     if(!VirtualProtect(blk.base, blk.size, PAGE_EXECUTE_READ, &oldProt)) {
-        log_message("ERROR", "VirtualProtect -> RX 失敗");
+        log_message("ERROR", "VirtualProtect -> RX failed");
         return false;
     }
 #else
     DWORD oldProt;
     if(!VirtualProtect(blk.base, blk.size, PAGE_EXECUTE_READWRITE, &oldProt)) {
-        log_message("ERROR", "VirtualProtect -> RWX 失敗");
+        log_message("ERROR", "VirtualProtect -> RWX failed");
         return false;
     }
 #endif
@@ -533,12 +533,16 @@ std::string get_current_process_name() {
 
 // 主函數
 int main() {
+    // 設置控制台編碼為 UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    
     std::cout << "=== Memory Attack Simulator ===" << std::endl;
     // 顯示當前進程名稱
     std::string process_name = get_current_process_name();
     std::cout << "Process name: " << process_name << std::endl;
     std::cout << "Process ID: " << GetCurrentProcessId() << std::endl;
-    std::cout << "[Instrumented Mode] 所有攻擊將觸發 WriteProcessMemory + VirtualProtect 事件" << std::endl;
+    std::cout << "[Instrumented Mode] All attacks will trigger WriteProcessMemory + VirtualProtect events" << std::endl;
     std::cout << "Available attacks (Realistic):" << std::endl;
     std::cout << "1. Heap Corruption Attack" << std::endl;
     std::cout << "2. Use-After-Free Attack" << std::endl;

@@ -15,6 +15,11 @@
 #include <functional>
 #include "utils/process_lists.hpp"
 #include "event_utils.hpp"
+#include "ring_buffer.hpp"
+#include "event_normalizer.hpp"
+#include "raw_event_types.hpp"
+// debug switches for binary-search disabling
+#include "debug_switches.hpp"
 
 // 前向聲明
 namespace RealMemoryDetection {
@@ -37,6 +42,21 @@ struct SuspiciousKey {
 struct SuspiciousKeyHash {
     size_t operator()(const SuspiciousKey& k) const noexcept {
         return (size_t)k.page ^ ((size_t)k.pid << 1);
+    }
+};
+
+// 追蹤跨進程可執行頁 (pid+base) key
+struct ExecKey {
+    DWORD pid;
+    uint64_t base;
+    bool operator==(const ExecKey& o) const noexcept {
+        return pid == o.pid && base == o.base;
+    }
+};
+
+struct ExecKeyHash {
+    size_t operator()(ExecKey const& k) const noexcept {
+        return ((size_t)k.pid * 1315423911u) ^ (size_t)k.base;
     }
 };
 
@@ -74,26 +94,30 @@ enum class EventSource : uint8_t {
 struct Event {
     enum class Type : uint8_t {
         // 原始行為事件（來自 hook/ETW）
-        MEM_PROTECT_CHANGE,
-        WRITE_PROCESS_MEMORY,
-        CREATE_REMOTE_THREAD,
-        IMAGE_LOAD,
-        FILE_WRITE,
-        HEAP_CORRUPTION,
-        CUSTOM,
+        MEM_PROTECT_CHANGE,        // 0
+        WRITE_PROCESS_MEMORY,      // 1
+        CREATE_REMOTE_THREAD,      // 2
+        IMAGE_LOAD,                // 3
+        FILE_WRITE,                // 4
+        HEAP_CORRUPTION,           // 5
+        CUSTOM,                    // 6
         
         // 內部任務事件（排程/分析/報表）
-        PROCESS_SCAN,           // 進程掃描事件
-        MEMORY_REGION_SCAN,     // 記憶體區域掃描事件
-        EXECUTABLE_INTEGRITY_CHECK, // 可執行檔案完整性檢查
-        HEAP_REGION_CHECK,      // 堆區域檢查
-        COMPREHENSIVE_ATTACK_DETECTION, // 綜合攻擊檢測
-        ALL_PROCESSES_SCAN,     // 全進程掃描
-        STATUS_OUTPUT,          // 狀態輸出
-        CYCLE_COMPLETION,       // 循環完成
-        CLEANUP_SIMULATOR,      // 清理模擬器
-        TERMINATE               // 終止事件
+        PROCESS_SCAN,              // 7
+        MEMORY_REGION_SCAN,        // 8
+        EXECUTABLE_INTEGRITY_CHECK, // 9
+        HEAP_REGION_CHECK,         // 10
+        COMPREHENSIVE_ATTACK_DETECTION, // 11
+        ALL_PROCESSES_SCAN,        // 12
+        STATUS_OUTPUT,             // 13
+        CYCLE_COMPLETION,          // 14
+        CLEANUP_SIMULATOR,         // 15
+        TERMINATE                  // 16
     };
+
+    // 診斷欄位
+    uint32_t struct_version = 1;
+    uint32_t sanity = 0xEFBEADDE;  // 魔術數字，用於檢測未初始化
 
     Type type;
     DWORD process_id;
@@ -114,6 +138,66 @@ struct Event {
     uint8_t depth;              // 防止無限遞迴
     uint8_t flags;              // bit0=reanalysis, bit1=high_risk
     uint32_t sequence_id;       // 事件序列號
+
+    // 預設建構函數 - 確保正確初始化
+    Event() : 
+        struct_version(1),
+        sanity(0xEFBEADDE),
+        type(Type::CUSTOM),
+        process_id(0),
+        address(0),
+        size(0),
+        timestamp_ms(0),
+        process_handle(nullptr),
+        process_category(MemoryDetectionEngine::ProcessCategory::USER_PROCESS),
+        priority(EventPriority::NORMAL),
+        source(EventSource::INTERNAL),
+        depth(0),
+        flags(0),
+        sequence_id(0) {
+        memset(&memory_info, 0, sizeof(memory_info));
+    }
+
+    // 靜態工廠方法，用於創建特定類型的事件
+    static Event make_event(Type t, DWORD pid = 0, uint64_t addr = 0, size_t sz = 0) {
+        Event ev{};
+        ev.type = t;
+        ev.process_id = pid;
+        ev.address = addr;
+        ev.size = sz;
+        ev.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return ev;
+    }
+
+    // 檢查事件是否正確初始化
+    bool is_valid() const {
+        return sanity == 0xEFBEADDE && struct_version == 1;
+    }
+
+    // 獲取事件類型名稱
+    std::string get_type_name() const {
+        switch (type) {
+            case Type::MEM_PROTECT_CHANGE: return "MEM_PROTECT_CHANGE";
+            case Type::WRITE_PROCESS_MEMORY: return "WRITE_PROCESS_MEMORY";
+            case Type::CREATE_REMOTE_THREAD: return "CREATE_REMOTE_THREAD";
+            case Type::IMAGE_LOAD: return "IMAGE_LOAD";
+            case Type::FILE_WRITE: return "FILE_WRITE";
+            case Type::HEAP_CORRUPTION: return "HEAP_CORRUPTION";
+            case Type::CUSTOM: return "CUSTOM";
+            case Type::PROCESS_SCAN: return "PROCESS_SCAN";
+            case Type::MEMORY_REGION_SCAN: return "MEMORY_REGION_SCAN";
+            case Type::EXECUTABLE_INTEGRITY_CHECK: return "EXECUTABLE_INTEGRITY_CHECK";
+            case Type::HEAP_REGION_CHECK: return "HEAP_REGION_CHECK";
+            case Type::COMPREHENSIVE_ATTACK_DETECTION: return "COMPREHENSIVE_ATTACK_DETECTION";
+            case Type::ALL_PROCESSES_SCAN: return "ALL_PROCESSES_SCAN";
+            case Type::STATUS_OUTPUT: return "STATUS_OUTPUT";
+            case Type::CYCLE_COMPLETION: return "CYCLE_COMPLETION";
+            case Type::CLEANUP_SIMULATOR: return "CLEANUP_SIMULATOR";
+            case Type::TERMINATE: return "TERMINATE";
+            default: return "UNKNOWN";
+        }
+    }
 };
 
 // 事件統計結構
@@ -132,6 +216,11 @@ struct EventStats {
     // 可疑區域統計
     std::atomic<uint64_t> suspicious_regions_analyzed{0};
     std::atomic<uint64_t> reanalysis_skipped{0};
+    
+    // 禁用複製構造函數和賦值操作符
+    EventStats() = default;
+    EventStats(const EventStats&) = delete;
+    EventStats& operator=(const EventStats&) = delete;
 };
 
 // 進程句柄快取項
@@ -143,9 +232,11 @@ struct ProcessHandleInfo {
 };
 
 // 擴展的 Event 處理器類別
-class EventHandler {
+// EventHandler no longer inherits MemoryMonitor to avoid dual-run race conditions.
+class EventHandler: public RealMemoryDetection::MemoryMonitor {
 public:
     EventHandler();
+    EventHandler(const MemoryMonitorConfig& config);
     ~EventHandler();
 
     // 基本操作
@@ -154,9 +245,15 @@ public:
     void enqueue_event(const Event& ev);
     void schedule_suspicious_region(DWORD pid, uint64_t address);
     
+    // 新增：事件驅動架構接口
+    bool push_raw_event(const RawEvent& raw_event);
+    bool push_raw_events(const std::vector<RawEvent>& raw_events);
+    const RawEventMPSCRingBuffer::Stats& get_raw_event_stats() const;
+    
     // 新增：設置依賴項
     void set_memory_monitor(MemoryMonitor* monitor);
     void set_detection_engine(void* engine); // 使用 void* 避免循環依賴
+    void log_to_detection_engine(const std::string& level, const std::string& message);
     
     // 新增：定時事件調度
     void schedule_periodic_scan();
@@ -168,6 +265,9 @@ public:
     const EventStats& get_stats() const { return stats_; }
 
 private:
+    // generation counter to drop stale events when handler is recreated
+    std::atomic<uint32_t> handler_generation_{1};
+
     // 原有成員
     std::mutex event_mutex_;
     std::condition_variable event_cv_;
@@ -193,10 +293,25 @@ private:
     // 完整性檢查重複計數
     std::mutex integrity_mutex_;
     std::unordered_map<std::pair<DWORD, uint64_t>, uint8_t, IntegrityKeyHash> integrity_recheck_count_;
+    
+    // 新增：可執行頁面追蹤器
+    struct ExecPageInfo {
+        DWORD last_protect;
+        uint64_t first_seen_ts;
+        uint64_t last_transition_ts;
+        bool seen_exec;
+    };
+    std::mutex exec_pages_mutex_;
+    std::unordered_map<ExecKey, ExecPageInfo, ExecKeyHash> exec_pages_;
+    
+    // 新增：watchlist
+    std::unordered_set<uint64_t> forced_watch_;
+    std::mutex watch_mtx_;
 
     std::thread fast_event_thread_;
     std::thread deferred_analyzer_thread_;
     std::atomic<bool> running_;
+    std::atomic<bool> shutting_down_{false}; // 防止析構後外部調用
     
     // 新增：定時調度線程
     std::thread scheduler_thread_;
@@ -221,13 +336,24 @@ private:
     std::chrono::steady_clock::time_point last_cycle_time_;
     
     // 新增：掃描配置
-    const std::chrono::seconds scan_interval_ = std::chrono::seconds(10);
-    const std::chrono::seconds comprehensive_interval_ = std::chrono::seconds(10);
-    const std::chrono::seconds status_interval_ = std::chrono::seconds(60);
-    const std::chrono::seconds cycle_interval_ = std::chrono::seconds(300);
-    const int max_regions_to_scan_ = 10;
+    const std::chrono::seconds scan_interval_ = std::chrono::seconds(1); // 縮短到1秒
+    const std::chrono::seconds comprehensive_interval_ = std::chrono::seconds(5); // 縮短到5秒
+    const std::chrono::seconds status_interval_ = std::chrono::seconds(30); // 縮短到30秒
+    const std::chrono::seconds cycle_interval_ = std::chrono::seconds(60); // 縮短到60秒
+    int max_regions_to_scan_ = 10;
+
+protected:
+    // Methods matching MemoryMonitor interface. Keep them virtual so a derived class
+    // that also inherits MemoryMonitor can satisfy the pure virtual requirements.
+    void deep_scan_process(DWORD process_id) override;
+    virtual void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
+    virtual void detect_attack_simulator_patterns(DWORD process_id, HANDLE hProcess);
+    virtual void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess);
+    virtual void detect_complex_attack_patterns(DWORD process_id, HANDLE hProcess);
+    virtual void detect_suspicious_behavior_patterns(DWORD process_id, HANDLE hProcess);
 
     // 原有方法
+private:
     void analyze_event_batch(const std::vector<Event>& batch);
     void fast_event_loop();
     void deferred_analyzer_loop();
@@ -250,17 +376,12 @@ private:
     // 新增：輔助方法
     void scan_memory_for_attacks();
     void scan_all_processes_memory();
+    void scan_process_memory(DWORD pid, HANDLE hProcess);
     void show_status();
     void cleanup_simulator_output_controls();
     void check_executable_integrity(LPVOID base_address, SIZE_T region_size, DWORD pid, int depth = 0);
-    void check_heap_region(LPVOID base_address, SIZE_T region_size);
-    void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
-    
-    // 新增：檢測方法
-    void detect_attack_simulator_patterns(DWORD process_id, HANDLE hProcess);
-    void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess);
-    void detect_complex_attack_patterns(DWORD process_id, HANDLE hProcess);
-    void detect_suspicious_behavior_patterns(DWORD process_id, HANDLE hProcess);
+    void check_heap_region(DWORD pid, LPVOID base_address, SIZE_T region_size);
+    // 新增：檢測方法（已在 override 部分聲明）
     
     // 新增：進程句柄管理
     HANDLE get_process_handle(DWORD pid);
@@ -275,6 +396,22 @@ private:
     void update_stats_on_drop(bool is_high_priority);
     void update_stats_on_finding();
     void update_stats_on_scan();
+    
+    // 新增：watchlist 功能
+    void add_exec_watch(uint64_t addr);
+    
+    // 新增：事件驅動架構相關
+    RawEventMPSCRingBuffer raw_event_buffer_;
+    std::thread real_time_ingest_thread_;
+    std::atomic<bool> ingest_running_;
+    
+    // 新增：實時事件攝取方法
+    void real_time_ingest_loop();
+    void process_normalized_events();
+    void convert_normalized_to_event(const PageTransitionEvent& normalized_event);
+    void convert_normalized_to_event(const CrossProcessWriteEvent& normalized_event);
+    void convert_normalized_to_event(const RemoteExecutionChainEvent& normalized_event);
+    void convert_normalized_to_event(const DarkExecEvent& normalized_event);
 };
 
 } // namespace RealMemoryDetection

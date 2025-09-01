@@ -6,6 +6,9 @@
 #include <iomanip>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <mutex>
+#include <fstream>
+#include <mutex>
 
 namespace RealMemoryDetection {
 
@@ -14,6 +17,37 @@ std::map<std::string, int> EventUtils::detection_stats_;
 std::map<std::string, double> EventUtils::detection_thresholds_;
 std::mutex EventUtils::stats_mutex_;
 std::mutex EventUtils::threshold_mutex_;
+static std::mutex g_log_mutex;
+static std::ofstream g_log_file;
+
+// 日誌函數
+void EventUtils::log_message(const char* level, const char* message) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+    
+    std::string log_entry = ss.str() + " [" + level + "] " + message + "\n";
+    
+    // 寫入到攻擊模擬器的log檔案
+    if (g_log_file.is_open()) {
+        g_log_file << log_entry;
+        g_log_file.flush();
+    }
+    
+    // 同時寫入到檢測引擎的log檔案，讓記憶體位址可以在檢測引擎log中找到
+    std::ofstream detection_log("logs/detection_engine.log", std::ios::app);
+    if (detection_log.is_open()) {
+        detection_log << log_entry;
+        detection_log.flush();
+        detection_log.close();
+    }
+    
+    std::cout << log_entry;
+}
 
 // 字串寫入操作檢測
 void EventUtils::detect_string_write_operations(DWORD process_id, HANDLE hProcess) {

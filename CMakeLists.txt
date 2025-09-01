@@ -12,8 +12,16 @@ if(MSVC)
     # Windows API 相關定義
     add_definitions(-DWIN32_LEAN_AND_MEAN)
     add_definitions(-D_WIN32_WINNT=0x0601)  # Windows 7+
+    
+    # 調試符號和優化選項
+    set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Ob0 /Od /Oy- /MDd /RTC1")
+    set(CMAKE_CXX_FLAGS_RELEASE "/Zi /O2 /MD /Oy-")
+    
+    # 啟用調試信息
+    add_compile_options(/Zi)
+    add_link_options(/DEBUG /INCREMENTAL:NO)
 else()
-    add_compile_options(-Wall -Wextra)
+    add_compile_options(-Wall -Wextra -g -O0)
 endif()
 
 # 設定 vcpkg 工具鏈
