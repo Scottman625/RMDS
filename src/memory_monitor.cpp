@@ -66,7 +66,9 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     , heap_monitoring_enabled_(config.enable_heap_monitoring)
     , stack_monitoring_enabled_(config.enable_stack_monitoring)
     , executable_monitoring_enabled_(config.enable_executable_monitoring)
-    , shared_memory_monitoring_enabled_(config.enable_shared_memory_monitoring) {
+    , shared_memory_monitoring_enabled_(config.enable_shared_memory_monitoring)
+    , violation_callback_(nullptr)
+    , deep_scan_callback_(nullptr) {
     
     // 初始化統計
     stats_.total_scans = 0;
@@ -88,7 +90,13 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     log_file_.open(config_.log_file, std::ios::app);
 }
 
-// Destructor is now defaulted in header file
+// 實現析構函數
+MemoryMonitor::~MemoryMonitor() {
+    stop();
+    if (log_file_.is_open()) {
+        log_file_.close();
+    }
+}
 
 bool MemoryMonitor::start() {
     if (running_) return true;
@@ -115,6 +123,10 @@ bool MemoryMonitor::is_running() const {
 
 void MemoryMonitor::set_violation_callback(MemoryViolationCallback callback) {
     violation_callback_ = callback;
+}
+
+void MemoryMonitor::set_deep_scan_callback(DeepScanCallback callback) {
+    deep_scan_callback_ = callback;
 }
 
 // 進程分類
@@ -259,7 +271,12 @@ void MemoryMonitor::scan_processes() {
                     }
                     if (proc.name.find("attack_simulator") != std::string::npos ||
                         proc.name.find("attack") != std::string::npos) {
-                        deep_scan_process(proc.pid);
+                        if (deep_scan_callback_) {
+                            log_message("DEBUG", "[DEEP-SCAN] 調用回調函數掃描攻擊模擬器: " + proc.name + " (PID: " + std::to_string(proc.pid) + ")");
+                            deep_scan_callback_(proc.pid);
+                        } else {
+                            log_message("WARN", "[DEEP-SCAN] 深度掃描回調未設置，跳過攻擊模擬器: " + proc.name + " (PID: " + std::to_string(proc.pid) + ")");
+                        }
                     } else {
                         monitor_process(proc.pid, proc.name);
                     }
@@ -1037,6 +1054,13 @@ bool MemoryMonitor::check_buffer_overflow_patterns(LPVOID address, SIZE_T size) 
 
 // 實現 deep_scan_process 函數，使用 event_handler.cpp 中的檢測函數
 void MemoryMonitor::deep_scan_process(DWORD process_id) {
+    log_message("DEBUG", "[DEEP-SCAN] 開始深度掃描進程: pid=" + std::to_string(process_id));
+    
+    // 調用 scan_process_memory 進行基本掃描
+    scan_process_memory(process_id, false);
+    
+    // 記錄深度掃描完成
+    log_message("DEBUG", "[DEEP-SCAN] 完成深度掃描進程: pid=" + std::to_string(process_id));
 }
 
 

@@ -164,9 +164,9 @@ void DetectionEngine::process_event(const MemoryEvent& event) {
 """
             
             response = await self.llm_client.generate_response(
-                task_type=TaskType.CODE_GENERATION,
+                task_type=TaskType.CPP_GENERATION,
                 prompt=prompt,
-                system_prompt=SYSTEM_PROMPTS[TaskType.CODE_GENERATION]
+                system_prompt=SYSTEM_PROMPTS[TaskType.CPP_GENERATION]
             )
             
             if response.error:

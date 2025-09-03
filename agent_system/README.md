@@ -59,10 +59,16 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
     "max_tokens": 4000,
     "temperature": 0.1
   },
-  "code_generation": {
+  "header_generation": {
     "provider": "openai",
-    "model": "gpt-4-turbo-preview",
-    "max_tokens": 6000,
+    "model": "gpt-5-mini",
+    "max_tokens": 15000,
+    "temperature": 0.1
+  },
+  "cpp_generation": {
+    "provider": "openai",
+    "model": "gpt-5-mini",
+    "max_tokens": 25000,
     "temperature": 0.1
   }
 }
@@ -89,7 +95,8 @@ python run_workflow.py show <workflow_id>
 |---------|---------|--------|------|
 | 需求分析 | Claude-3-Sonnet | Anthropic | 深度理解和分析能力強 |
 | 任務分解 | Claude-3-Sonnet | Anthropic | 邏輯分析和規劃能力強 |
-| 代碼生成 | GPT-4-Turbo | OpenAI | 代碼生成質量高 |
+| 頭文件生成 | GPT-5-Mini | OpenAI | 頭文件接口設計能力強 |
+| C++ 代碼生成 | GPT-5-Mini | OpenAI | 代碼生成質量高 |
 | 代碼審查 | Claude-3-Sonnet | Anthropic | 安全性和質量檢查 |
 | 測試生成 | GPT-4-Turbo | OpenAI | 結構化代碼生成 |
 | 質量評估 | Claude-3-Sonnet | Anthropic | 綜合分析能力強 |

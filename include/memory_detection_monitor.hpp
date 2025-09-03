@@ -159,20 +159,17 @@ struct MonitorStats {
 // 記憶體違規回調
 using MemoryViolationCallback = std::function<void(AttackType, uint64_t, const std::string&, double, DWORD)>;
 
+// 深度掃描回調
+using DeepScanCallback = std::function<void(DWORD)>;
+
 /**
  * 統一的記憶體監控器
  * 作為底層工具庫供 detection_engine 使用
  */
 class MemoryMonitor : public MagicHeader {
-
-protected:
-    static const uint8_t* find_pattern(const uint8_t* haystack, size_t haystack_len, const char* needle, size_t needle_len);
-
 public:
     explicit MemoryMonitor(const MemoryMonitorConfig& config = MemoryMonitorConfig{});
-    virtual ~MemoryMonitor() {
-        invalidate(); // 標記為無效
-    }
+    virtual ~MemoryMonitor();
 
     // 基本控制
     bool start();
@@ -184,6 +181,7 @@ public:
     
     // 回調設置
     void set_violation_callback(MemoryViolationCallback callback);
+    void set_deep_scan_callback(DeepScanCallback callback);
     
     // 進程監控工具函數
     void scan_processes();
@@ -212,6 +210,8 @@ public:
     static double calculate_shannon_entropy(const uint8_t* buffer, size_t size, const std::string& process_name);
     static bool is_valid_shellcode(const uint8_t* buffer, size_t size, const std::string& process_name);
     static bool detect_modern_shellcode(const uint8_t* buffer, size_t size);
+    // pattern search helper (declared static to match implementation)
+    static const uint8_t* find_pattern(const uint8_t* haystack, size_t haystack_len, const char* needle, size_t needle_len);
     
     // 統計和狀態
     MonitorStats get_stats() const;
@@ -233,6 +233,13 @@ public:
 
 
 
+protected:
+    // 把這些執行緒/狀態變數放到 protected，允許子類存取（EventHandler 需要）
+    std::atomic<bool> running_{false};
+    std::atomic<bool> scheduler_running_{false};
+    std::mutex monitor_mutex_;
+    std::condition_variable monitor_cv_;
+    
 private:
     // 監控線程
     void monitor_loop();
@@ -274,13 +281,14 @@ private:
     MemoryMonitorConfig config_;
     AdaptiveThresholds adaptive_thresholds_;
     
-    // 運行狀態
-    std::atomic<bool> running_;
+    // 運行狀態 (private duplicate removed; use protected running_)
+    // std::atomic<bool> running_; // removed duplicate
     std::thread monitor_thread_;
     std::thread process_monitor_thread_;
     std::thread memory_monitor_thread_;
     
     // 回調
+    DeepScanCallback deep_scan_callback_;
     MemoryViolationCallback violation_callback_;
     
     // 數據結構
@@ -310,4 +318,4 @@ private:
     std::atomic<bool> shared_memory_monitoring_enabled_;
 };
 
-} // namespace RealMemoryDetection 
+} // namespace RealMemoryDetection

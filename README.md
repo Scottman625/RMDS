@@ -15,6 +15,7 @@
 - **詳細日誌記錄**: 完整的攻擊檢測和系統狀態日誌
 - **反取證技術**: 支援記憶體指紋混淆和動態環境混淆
 - **分散式多線程**: 使用多線程架構進行並行檢測
+- **事件驅動架構**: 基於事件驅動的檢測和響應系統
 
 ## 項目組件
 
@@ -24,6 +25,7 @@
 - 智能進程優先級排序
 - 多線程檢測架構
 - 支援反取證模式（ENTROPY=7.2）
+- 事件驅動檢測響應
 
 ### 2. 攻擊模擬器 (attack_simulator.exe)
 - 模擬分散式ROP攻擊（Scattered ROP）
@@ -39,10 +41,9 @@
 - 記憶體區域完整性檢查
 
 ### 4. Agent 工作流系統 (agent_system/)
-- **Orchestrator Agent** - 工作流編排與任務調度
-- **Threat Intel Agent** - 威脅情報收集與分析
-- **Feature Designer Agent** - 記憶體特徵工程
-- **Attack Simulator Agent** - 攻擊場景回放與驗證
+- **MCP Server** - 安全的代碼讀寫操作和權限控制
+- **Workflow Orchestrator** - 工作流生命週期管理和Agent協調
+- **LLM Client** - 統一的LLM API客戶端，支援OpenAI和Anthropic
 - 事件驅動架構，支援自動化威脅響應
 - 智能特徵生成與優化
 - 實時監控與 KPI 追蹤
@@ -64,6 +65,10 @@ RMDS/
 │   ├── attack_simulator.cpp      # 攻擊模擬器
 │   ├── memory_monitor.cpp        # 內存監控器
 │   ├── memory_monitor_main.cpp   # 內存監控器主程序
+│   ├── event_handler.cpp         # 事件處理器
+│   ├── event_normalizer.cpp      # 事件正規化
+│   ├── event_utils.cpp           # 事件工具函數
+│   ├── crash_handler.cpp         # 崩潰處理器
 │   ├── logger.cpp                # 日誌系統
 │   ├── memory_detection_utils.cpp # 工具函數
 │   ├── memory_detection_veh.cpp  # 向量化異常處理
@@ -75,27 +80,32 @@ RMDS/
 │   ├── memory_detection_utils.hpp
 │   ├── memory_detection_veh.hpp
 │   ├── detection_engine.hpp
+│   ├── event_handler.hpp
+│   ├── event_normalizer.hpp
+│   ├── event_utils.hpp
+│   ├── crash_handler.hpp
 │   └── utils/
 │       ├── logger.hpp
 │       └── performance_monitor.hpp
 ├── agent_system/         # Agent 工作流系統
-│   ├── agents/           # Agent 實作
-│   │   ├── base_agent.py
-│   │   ├── orchestrator.py
-│   │   ├── threat_intel.py
-│   │   ├── feature_designer.py
-│   │   └── attack_simulator.py
-│   ├── events/           # 事件系統
-│   │   └── event_bus.py
-│   ├── main.py           # 主程序
-│   ├── test_system.py    # 測試腳本
-│   ├── run_agent_system.py # 啟動腳本
-│   ├── start_agents.bat  # Windows 批處理
-│   ├── requirements.txt  # Python 依賴
-│   └── README.md         # Agent 系統文檔
+│   ├── workflow_orchestrator.py  # 工作流編排器
+│   ├── mcp_server.py            # MCP 服務器
+│   ├── llm_client.py            # LLM 客戶端
+│   ├── run_workflow.py          # 工作流運行器
+│   ├── start_workflow.bat       # Windows 啟動腳本
+│   ├── llm_config.json          # LLM 配置
+│   ├── policy.json              # 權限策略
+│   ├── requirements.txt         # Python 依賴
+│   ├── templates/               # 模板文件
+│   └── test/                    # 測試文件
 ├── docs/               # 文檔
 ├── build/              # 建置檔案
+├── tests/              # 測試文件
+├── logs/               # 日誌文件
+├── dumps/              # 記憶體轉儲
 ├── run.bat            # 快速啟動腳本
+├── build_project.bat  # 建置腳本
+├── run_tests.py       # 測試運行器
 └── CMakeLists.txt     # CMake配置
 ```
 
@@ -111,7 +121,13 @@ RMDS/
 
 ### 建置步驟
 
-#### 方法一：使用CMake
+#### 方法一：使用建置腳本（推薦）
+```bash
+# 使用批處理腳本自動建置
+build_project.bat
+```
+
+#### 方法二：使用CMake
 ```bash
 # 創建建置目錄
 mkdir build
@@ -124,7 +140,7 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-#### 方法二：使用Visual Studio
+#### 方法三：使用Visual Studio
 1. 打開 `RealTimeMemoryAttackDetectEngine.sln`
 2. 選擇 Release 配置
 3. 建置解決方案
@@ -137,7 +153,13 @@ cmake --build . --config Release
 run.bat
 ```
 
-#### 方法二：手動運行
+#### 方法二：使用Python測試腳本
+```bash
+# 運行基本測試
+python run_tests.py
+```
+
+#### 方法三：手動運行
 1. **啟動檢測引擎**:
    ```bash
    cd build/src/Release
@@ -162,26 +184,24 @@ run.bat
 # 進入 Agent 系統目錄
 cd agent_system
 
-# 初始設置
-python run_agent_system.py --setup
+# 安裝依賴
+pip install -r requirements.txt
 
-# 運行演示模式
-python run_agent_system.py --demo
+# 設置環境變量
+cp env_example.txt .env
+# 編輯 .env 文件，填入您的 API 金鑰
 
-# 運行系統測試
-python run_agent_system.py --test
+# 運行工作流
+python run_workflow.py run "添加新的記憶體檢測功能"
 
-# 正常啟動
-python run_agent_system.py
+# 查看工作流狀態
+python run_workflow.py list
 ```
 
 #### 或使用批處理腳本
 ```bash
 # Windows 批處理啟動
-start_agents.bat --demo    # 演示模式
-start_agents.bat --test    # 測試模式
-start_agents.bat --setup   # 初始設置
-start_agents.bat           # 正常模式
+start_workflow.bat
 ```
 
 ## 使用說明
@@ -193,6 +213,7 @@ start_agents.bat           # 正常模式
 - 實時內存區域檢測
 - 詳細日誌記錄
 - 支援反取證模式
+- 事件驅動檢測響應
 
 ### 攻擊模擬器功能
 - 選擇攻擊類型（1-5）
@@ -208,6 +229,15 @@ start_agents.bat           # 正常模式
 - 動態環境混淆
 - 虛擬執行環境建立
 - 自動清理程序（60分鐘後）
+
+### Agent 工作流功能
+- **需求分析**: 使用 Claude 進行深度需求理解
+- **任務分解**: 使用 Claude 進行邏輯分析和規劃
+- **代碼開發**: 使用 GPT-4 進行高質量代碼生成
+- **代碼審查**: 使用 Claude 進行安全性和質量檢查
+- **靜態分析**: 結合工具和 Claude 進行代碼分析
+- **測試生成**: 使用 GPT-4 生成結構化測試
+- **質量評估**: 使用 Claude 進行綜合評估
 
 ## 配置選項
 
@@ -227,6 +257,11 @@ start_agents.bat           # 正常模式
 - `/dynamic`: 啟用動態模式
 - `/jitc`: 啟用JIT編譯
 
+### Agent 系統配置
+- **LLM 配置** (`llm_config.json`): 為不同任務配置適合的模型
+- **權限策略** (`policy.json`): 控制文件訪問權限
+- **環境變量** (`.env`): API 金鑰和系統配置
+
 ## 日誌分析
 
 ### 檢測引擎日誌
@@ -242,6 +277,11 @@ start_agents.bat           # 正常模式
 - 攻擊統計數據
 - 分散式ROP區域信息
 
+### Agent 工作流日誌
+- 工作流執行日誌 (`logs/workflow.log`)
+- MCP 服務器日誌 (`logs/mcp_server.log`)
+- LLM 客戶端日誌 (`logs/llm_client.log`)
+
 ## 技術特性
 
 ### 反取證技術
@@ -255,6 +295,13 @@ start_agents.bat           # 正常模式
 - **現代Shellcode檢測**: 支援多種現代攻擊框架特徵
 - **自適應閾值**: 根據進程類型調整檢測敏感度
 - **多線程架構**: 並行處理提高檢測效率
+- **事件驅動架構**: 基於事件的檢測和響應
+
+### Agent 系統技術
+- **MCP 協議**: 安全的代碼讀寫操作
+- **多模型協作**: 結合不同LLM模型的優勢
+- **權限隔離**: 通過策略文件控制訪問
+- **操作審計**: 完整的操作追蹤和日誌
 
 ## 故障排除
 
@@ -277,6 +324,11 @@ start_agents.bat           # 正常模式
    - 確保logs目錄存在
    - 檢查寫入權限
 
+5. **Agent 系統問題**
+   - 檢查API 金鑰設置
+   - 驗證權限策略配置
+   - 查看詳細日誌
+
 ## 開發計劃
 
 - [x] 支援分散式ROP攻擊檢測
@@ -284,11 +336,15 @@ start_agents.bat           # 正常模式
 - [x] 添加反取證技術
 - [x] 統一日誌系統
 - [x] **Agent 工作流系統** - 自動化威脅響應與特徵工程
+- [x] **事件驅動架構** - 基於事件的檢測和響應
+- [x] **MCP 協議整合** - 安全的代碼操作
 - [ ] 支援更多攻擊類型
 - [ ] 改進進程優先級算法
 - [ ] 添加圖形化界面
 - [ ] 支援Linux平台
 - [ ] 性能優化
+- [ ] Web 界面支援
+- [ ] 工作流模板系統
 
 ## 授權
 

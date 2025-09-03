@@ -357,6 +357,110 @@ class MCPServer:
             )
             self._log_action("list_files", params, result)
             return result
+
+    def list_functions(self, params: Dict[str, Any]) -> ActionResult:
+        """列出指定檔案中的函數和類定義"""
+        trace_id = self._generate_trace_id()
+        
+        try:
+            file_path = params.get("path", "")
+            if not file_path:
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error="File path is required",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 檢查權限
+            if not self._check_permission(file_path, "read"):
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Permission denied: cannot read {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 構建完整路徑
+            full_path = self.repo_root / file_path
+            
+            if not full_path.exists():
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"File does not exist: {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            if not full_path.is_file():
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"Path is not a file: {file_path}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 檢查文件類型
+            if full_path.suffix.lower() not in ['.cpp', '.c', '.hpp', '.h', '.cc', '.cxx']:
+                return ActionResult(
+                    success=False,
+                    data={},
+                    error=f"File type not supported for function extraction: {full_path.suffix}",
+                    trace_id=trace_id,
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                )
+            
+            # 讀取文件內容
+            try:
+                with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            except UnicodeDecodeError:
+                # 嘗試其他編碼
+                try:
+                    with open(full_path, 'r', encoding='latin-1', errors='ignore') as f:
+                        content = f.read()
+                except Exception as e:
+                    return ActionResult(
+                        success=False,
+                        data={},
+                        error=f"Failed to read file with any encoding: {str(e)}",
+                        trace_id=trace_id,
+                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+                    )
+            
+            # 提取函數和類定義
+            functions = self._extract_functions_from_content(content, file_path)
+            
+            result = ActionResult(
+                success=True,
+                data={
+                    "file_path": file_path,
+                    "file_size": len(content),
+                    "total_functions": len(functions),
+                    "functions": functions,
+                    "extraction_method": "regex_parsing"
+                },
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            
+            self._log_action("list_functions", params, result)
+            return result
+            
+        except Exception as e:
+            result = ActionResult(
+                success=False,
+                data={},
+                error=f"Failed to list functions: {str(e)}",
+                trace_id=trace_id,
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self._log_action("list_functions", params, result)
+            return result
     
     def read_file(self, params: Dict[str, Any]) -> ActionResult:
         """讀取文件"""
@@ -1912,6 +2016,187 @@ class MCPServer:
             self._log_action("execute_binary", params, result)
             return result
 
+    def _extract_functions_from_content(self, content: str, file_path: str) -> List[Dict[str, Any]]:
+        """從文件內容中提取函數和類定義"""
+        functions = []
+        lines = content.split('\n')
+        
+        # 正則表達式模式
+        patterns = [
+            # 類定義
+            (r'class\s+(\w+)(?:\s*:\s*(?:public|private|protected)\s+(\w+))?\s*\{', 'class'),
+            # 結構體定義
+            (r'struct\s+(\w+)(?:\s*:\s*(?:public|private|protected)\s+(\w+))?\s*\{', 'struct'),
+            # 函數定義 (包括模板)
+            (r'(?:template\s*<[^>]*>\s*)?(?:static\s+)?(?:inline\s+)?(?:const\s+)?(?:volatile\s+)?(?:constexpr\s+)?(?:explicit\s+)?(?:virtual\s+)?(?:override\s+)?(?:final\s+)?(?:noexcept\s*\([^)]*\)\s*)?(?:const\s+)?(?:volatile\s+)?(?:&?\s*)?(\w+(?:::\w+)*)\s+(\w+)\s*\([^)]*\)\s*(?:const\s+)?(?:volatile\s+)?(?:&?\s*)?(?:override\s+)?(?:final\s+)?(?:noexcept\s*\([^)]*\)\s*)?(?:const\s+)?(?:volatile\s+)?(?:&?\s*)?\s*\{', 'function'),
+            # 構造函數/析構函數
+            (r'(\w+(?:::\w+)*)\s*::\s*(\w+)\s*\([^)]*\)\s*(?:const\s+)?(?:volatile\s+)?(?:&?\s*)?(?:override\s+)?(?:final\s+)?(?:noexcept\s*\([^)]*\)\s*)?(?:const\s+)?(?:volatile\s+)?(?:&?\s*)?\s*\{', 'method'),
+            # 運算符重載
+            (r'(?:operator\s*[+\-*/=<>!&|^%]+\s*\([^)]*\)\s*\{)', 'operator'),
+            # 命名空間
+            (r'namespace\s+(\w+)\s*\{', 'namespace'),
+            # 枚舉
+            (r'enum\s+(?:class\s+)?(\w+)\s*\{', 'enum'),
+            # 宏定義
+            (r'#define\s+(\w+)', 'macro'),
+            # 類型定義
+            (r'typedef\s+.*\s+(\w+)\s*;', 'typedef'),
+            (r'using\s+(\w+)\s*=', 'using')
+        ]
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or line.startswith('//') or line.startswith('/*'):
+                continue
+            
+            for pattern, func_type in patterns:
+                matches = re.finditer(pattern, line)
+                for match in matches:
+                    try:
+                        if func_type == 'class':
+                            class_name = match.group(1)
+                            base_class = match.group(2) if match.group(2) else None
+                            functions.append({
+                                "name": class_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "base_class": base_class,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'struct':
+                            struct_name = match.group(1)
+                            base_struct = match.group(2) if match.group(2) else None
+                            functions.append({
+                                "name": struct_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "base_struct": base_struct,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'function':
+                            return_type = match.group(1)
+                            func_name = match.group(2)
+                            functions.append({
+                                "name": func_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "return_type": return_type,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'method':
+                            class_name = match.group(1)
+                            method_name = match.group(2)
+                            functions.append({
+                                "name": f"{class_name}::{method_name}",
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "class": class_name,
+                                "method": method_name,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'operator':
+                            functions.append({
+                                "name": "operator",
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'namespace':
+                            namespace_name = match.group(1)
+                            functions.append({
+                                "name": namespace_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'enum':
+                            enum_name = match.group(1)
+                            functions.append({
+                                "name": enum_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'macro':
+                            macro_name = match.group(1)
+                            functions.append({
+                                "name": macro_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'typedef':
+                            typedef_name = match.group(1)
+                            functions.append({
+                                "name": typedef_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                        elif func_type == 'using':
+                            using_name = match.group(1)
+                            functions.append({
+                                "name": using_name,
+                                "type": func_type,
+                                "line": line_num,
+                                "signature": line,
+                                "scope": self._get_scope_at_line(lines, line_num)
+                            })
+                    except Exception as e:
+                        # 如果解析某個匹配項失敗，繼續處理下一個
+                        logger.debug(f"Failed to parse match in line {line_num}: {e}")
+                        continue
+        
+        # 按行號排序
+        functions.sort(key=lambda x: x["line"])
+        
+        return functions
+
+    def _get_scope_at_line(self, lines: List[str], target_line: int) -> str:
+        """獲取指定行號處的作用域"""
+        scope_stack = []
+        current_scope = "global"
+        
+        for i, line in enumerate(lines[:target_line], 1):
+            line = line.strip()
+            
+            # 跳過註釋和空行
+            if not line or line.startswith('//') or line.startswith('/*'):
+                continue
+            
+            # 檢測命名空間開始
+            if line.startswith('namespace ') and line.endswith('{'):
+                namespace_match = re.match(r'namespace\s+(\w+)', line)
+                if namespace_match:
+                    namespace_name = namespace_match.group(1)
+                    scope_stack.append(f"namespace::{namespace_name}")
+                    current_scope = f"namespace::{namespace_name}"
+            
+            # 檢測類開始
+            elif (line.startswith('class ') or line.startswith('struct ')) and line.endswith('{'):
+                class_match = re.match(r'(?:class|struct)\s+(\w+)', line)
+                if class_match:
+                    class_name = class_match.group(1)
+                    scope_stack.append(f"class::{class_name}")
+                    current_scope = f"class::{class_name}"
+            
+            # 檢測作用域結束
+            elif line == '}':
+                if scope_stack:
+                    scope_stack.pop()
+                    current_scope = scope_stack[-1] if scope_stack else "global"
+        
+        return current_scope
+
 # 使用範例
 def main():
     """主函數範例"""
@@ -1925,6 +2210,14 @@ def main():
     # 測試讀取文件
     result = server.read_file({"path": "src/detection_engine.cpp"})
     print(f"Read file result: {result.success}")
+    
+    # 測試列出函數
+    result = server.list_functions({"path": "src/detection_engine.cpp"})
+    print(f"List functions result: {result.success}")
+    if result.success:
+        print(f"Found {result.data['total_functions']} functions/classes")
+        for func in result.data['functions'][:5]:  # 只顯示前5個
+            print(f"  {func['type']}: {func['name']} at line {func['line']}")
     
     # 測試乾運行補丁
     test_patch = """--- a/src/test.cpp

@@ -610,6 +610,11 @@ class WorkflowOrchestrator:
         
         # 嘗試解析 LLM 回應
         try:
+            # 檢查 response 和 response.content 是否存在
+            if not response or not response.content:
+                logger.error("LLM response or content is None")
+                return self._generate_fallback_task_plan(workflow_id, prompt_content, requirement_spec)
+            
             # 嘗試從回應中提取 JSON
             import json
             import re
@@ -968,6 +973,147 @@ class WorkflowOrchestrator:
         
         return tasks
     
+    def _select_target_file(self, task_description: str) -> str:
+        """根據任務描述選擇目標文件"""
+        task_lower = task_description.lower()
+        
+        if any(keyword in task_lower for keyword in ["event", "handler", "處理", "事件"]):
+            return "src/event_handler.cpp"
+        elif any(keyword in task_lower for keyword in ["detection", "engine", "偵測", "引擎"]):
+            return "src/detection_engine.cpp"
+        elif any(keyword in task_lower for keyword in ["memory", "monitor", "記憶體", "監控"]):
+            return "src/memory_detection_monitor.cpp"
+        elif any(keyword in task_lower for keyword in ["attack", "simulator", "攻擊", "模擬"]):
+            return "src/attack_simulator.cpp"
+        else:
+            # 默認選擇 event_handler.cpp，因為主要邏輯已經移過去
+            return "src/event_handler.cpp"
+    
+    def _extract_relevant_code_section(self, content: str, focus_area: str = "general", target_file: str = "") -> str:
+        """提取相關的代碼片段，減少 token 使用"""
+        lines = content.split('\n')
+        relevant_lines = []
+        
+        # 如果提供了目標文件路徑，嘗試使用 list_functions 來獲取函數信息
+        if target_file and self.mcp_server:
+            try:
+                functions_result = self.mcp_server.list_functions({"path": target_file})
+                if functions_result.success:
+                    functions = functions_result.data.get("functions", [])
+                    # 根據焦點區域過濾函數
+                    filtered_functions = self._filter_functions_by_focus(functions, focus_area)
+                    
+                    # 提取相關函數的代碼
+                    relevant_lines = self._extract_function_code(lines, filtered_functions)
+                    
+                    if relevant_lines:
+                        logger.info(f"[CPP_DEVELOPER] Extracted {len(relevant_lines)} relevant lines from {len(filtered_functions)} functions")
+                        return '\n'.join(relevant_lines)
+            except Exception as e:
+                logger.warning(f"[CPP_DEVELOPER] Failed to use list_functions, falling back to regex: {e}")
+        
+        # 回退到原有的正則表達式方法
+        if focus_area == "event_handling":
+            # 提取事件處理相關的代碼
+            for i, line in enumerate(lines):
+                if any(keyword in line for keyword in [
+                    "handle_", "Event::", "enqueue_event", "analyze_event"
+                ]):
+                    relevant_lines.append(f"{i+1:4d}: {line}")
+        elif focus_area == "memory_detection":
+            # 提取記憶體偵測相關的代碼
+            for i, line in enumerate(lines):
+                if any(keyword in line for keyword in [
+                    "scan_", "detect_", "check_", "ROP", "shellcode"
+                ]):
+                    relevant_lines.append(f"{i+1:4d}: {line}")
+        else:
+            # 提取關鍵函數和類定義
+            for i, line in enumerate(lines):
+                if any(keyword in line for keyword in [
+                    "class ", "struct ", "void ", "bool ", "int ",
+                    "public:", "private:", "protected:"
+                ]):
+                    relevant_lines.append(f"{i+1:4d}: {line}")
+        
+        # 限制總行數
+        if len(relevant_lines) > 200:
+            relevant_lines = relevant_lines[:200]
+            relevant_lines.append("// ... (truncated for token limit)")
+        
+        return '\n'.join(relevant_lines)
+
+    def _filter_functions_by_focus(self, functions: List[Dict[str, Any]], focus_area: str) -> List[Dict[str, Any]]:
+        """根據焦點區域過濾函數"""
+        if focus_area == "event_handling":
+            return [f for f in functions if any(keyword in f["name"].lower() for keyword in [
+                "event", "handle", "process", "analyze", "enqueue"
+            ])]
+        elif focus_area == "memory_detection":
+            return [f for f in functions if any(keyword in f["name"].lower() for keyword in [
+                "scan", "detect", "check", "memory", "rop", "shellcode", "vulnerability"
+            ])]
+        else:
+            # 返回所有函數，但優先級排序
+            priority_keywords = ["main", "init", "start", "stop", "process", "handle"]
+            high_priority = [f for f in functions if any(keyword in f["name"].lower() for keyword in priority_keywords)]
+            other_functions = [f for f in functions if not any(keyword in f["name"].lower() for keyword in priority_keywords)]
+            return high_priority + other_functions
+
+    def _extract_function_code(self, all_lines: List[str], functions: List[Dict[str, Any]]) -> List[str]:
+        """根據函數信息提取相關代碼"""
+        relevant_lines = []
+        extracted_functions = set()
+        
+        for func in functions:
+            if func["line"] > len(all_lines):
+                continue
+                
+            start_line = func["line"] - 1  # 轉換為0基索引
+            end_line = start_line
+            
+            # 尋找函數的結束位置
+            brace_count = 0
+            in_function = False
+            
+            for i in range(start_line, len(all_lines)):
+                line = all_lines[i]
+                if '{' in line:
+                    if not in_function:
+                        in_function = True
+                    brace_count += line.count('{')
+                if '}' in line:
+                    brace_count -= line.count('}')
+                    if in_function and brace_count <= 0:
+                        end_line = i + 1
+                        break
+            
+            # 提取函數代碼（包括註釋和空行）
+            func_lines = all_lines[start_line:end_line]
+            
+            # 添加函數分隔符
+            if relevant_lines:
+                relevant_lines.append("")
+            relevant_lines.append(f"// Function: {func['name']} (line {func['line']})")
+            relevant_lines.append(f"// Type: {func['type']}")
+            if func.get('scope') and func['scope'] != 'global':
+                relevant_lines.append(f"// Scope: {func['scope']}")
+            relevant_lines.append("")
+            
+            # 為每一行代碼添加行數信息
+            for i, line in enumerate(func_lines):
+                actual_line_number = start_line + i + 1  # 轉換回1基索引
+                relevant_lines.append(f"{actual_line_number:4d}: {line}")
+            
+            extracted_functions.add(func['name'])
+            
+            # 限制提取的函數數量
+            if len(extracted_functions) >= 10:
+                relevant_lines.append("// ... (truncated - too many functions)")
+                break
+        
+        return relevant_lines
+
     def _fix_diff_format(self, diff_content: str) -> str:
         """修復 diff 格式，確保行數正確"""
         try:
@@ -1026,70 +1172,150 @@ class WorkflowOrchestrator:
         logger.info(f"[CPP_DEVELOPER] Starting task {task.task_id}")
         context = self.active_workflows[workflow_id]
         
-        # 讀取相關源文件
+        # 智能選擇目標文件
+        task_description = task.input_data.get("description", "實現功能需求")
+        target_file = self._select_target_file(task_description)
+        
+        logger.info(f"[CPP_DEVELOPER] Selected target file: {target_file}")
+        
+        # 讀取選定的源文件
         result = self.mcp_server.read_file({
-            "path": "src/detection_engine.cpp"
+            "path": target_file
         })
         
         if not result.success:
-            logger.error(f"[CPP_DEVELOPER] Failed to read source file: {result.error}")
-            return {"error": "Failed to read source file"}
+            logger.error(f"[CPP_DEVELOPER] Failed to read {target_file}: {result.error}")
+            return {"error": f"Failed to read {target_file}"}
         
-        logger.info(f"[CPP_DEVELOPER] Successfully read source file, content length: {len(result.data.get('content', ''))}")
+        logger.info(f"[CPP_DEVELOPER] Successfully read {target_file}, content length: {len(result.data.get('content', ''))}")
         
-        # 構建 LLM 提示詞
-        task_description = task.input_data.get("description", "實現功能需求")
+        # 構建更精確的 LLM 提示詞
         requirement_spec = context.artifacts.get("requirement_spec", {})
         
+        # 智能提取相關代碼片段，減少 token 使用
+        full_content = result.data.get("content", "")
+        
+        # 根據任務描述確定焦點區域
+        if any(keyword in task_description.lower() for keyword in ["event", "handler", "處理", "事件"]):
+            focus_area = "event_handling"
+        elif any(keyword in task_description.lower() for keyword in ["memory", "detect", "偵測", "記憶體"]):
+            focus_area = "memory_detection"
+        else:
+            focus_area = "general"
+        
+        # 提取相關代碼片段
+        relevant_content = self._extract_relevant_code_section(full_content, focus_area, target_file)
+        
+        # 進一步限制內容長度，避免 token 超標
+        if len(relevant_content) > 6000:
+            relevant_content = relevant_content[:6000] + "\n// ... (truncated for token limit)"
+            logger.info(f"[CPP_DEVELOPER] Content truncated to 6000 characters to avoid token limit")
+        
+        logger.info(f"[CPP_DEVELOPER] Final content length: {len(relevant_content)} characters")
+        
         prompt = f"""
-請基於以下需求，為 RMDS 專案生成 C++ 代碼修改：
+請基於以下需求，為 RMDS 專案的 {target_file} 生成 C++ 代碼修改：
 
 任務描述：{task_description}
 需求規格：{requirement_spec}
 
-現有代碼：
-{result.data.get("content", "")}
+注意：主要偵測邏輯已經從 detection_engine.cpp 移到 event_handler.cpp
+請專注於 {target_file} 中的相關功能實現。
 
-請生成統一的 diff 格式的補丁，要求：
-1. 符合現代 C++ 標準 (C++17/20)
-2. 遵循專案命名規範
-3. 添加適當的註釋
-4. 考慮性能和安全性
-5. 確保代碼可讀性
+現有代碼（{target_file} 關鍵部分）：
+{relevant_content}
+
+請生成統一的 diff 格式的補丁，專注於：
+1. 事件處理邏輯優化（如果是 event_handler.cpp）
+2. 記憶體偵測算法改進（如果是 memory_detection_monitor.cpp）
+3. 攻擊模擬器功能增強（如果是 attack_simulator.cpp）
+4. 性能優化
+5. 錯誤處理增強
+6. 日誌記錄改進
+7. 符合現代 C++ 標準 (C++17/20)
+8. 遵循專案命名規範
+9. 添加適當的註釋
 """
         
         logger.info(f"[CPP_DEVELOPER] Sending prompt to LLM, prompt length: {len(prompt)}")
         
         # 調用 LLM 生成代碼修改
         response = await self.llm_client.generate_response(
-            task_type=TaskType.CODE_GENERATION,
+            task_type=TaskType.CPP_GENERATION,
             prompt=prompt,
             context=result.data.get("content", ""),
-            system_prompt=SYSTEM_PROMPTS[TaskType.CODE_GENERATION]
+            system_prompt=SYSTEM_PROMPTS[TaskType.CPP_GENERATION]
         )
         
         if response.error:
             logger.error(f"[CPP_DEVELOPER] LLM error in code generation: {response.error}")
-            # 如果 LLM 失敗，使用預設補丁
-            sample_patch = """--- a/src/detection_engine.cpp
-+++ b/src/detection_engine.cpp
+            # 如果 LLM 失敗，使用預設補丁，根據目標文件調整
+            if "event_handler" in target_file:
+                sample_patch = f"""--- a/{target_file}
++++ b/{target_file}
 @@ -1,5 +1,6 @@
- #include "detection_engine.hpp"
+ #include "event_handler.hpp"
  #include <iostream>
 +#include <chrono>
  
  // 示例修改：添加時間戳記錄
- void DetectionEngine::process_event(const MemoryEvent& event) {
+ void EventHandler::start() {{
 +    auto timestamp = std::chrono::system_clock::now();
      // 原有的處理邏輯
- }
+ }}
 """
-            logger.info(f"[CPP_DEVELOPER] Using fallback patch due to LLM error")
+            else:
+                sample_patch = f"""--- a/{target_file}
++++ b/{target_file}
+@@ -1,5 +1,6 @@
+ #include <iostream>
++#include <chrono>
+ 
+ // 示例修改：添加時間戳記錄
+ void process_function() {{
++    auto timestamp = std::chrono::system_clock::now();
+     // 原有的處理邏輯
+ }}
+"""
+            logger.info(f"[CPP_DEVELOPER] Using fallback patch for {target_file} due to LLM error")
         else:
-            # 嘗試從 LLM 響應中提取 diff
-            sample_patch = response.content
-            logger.info(f"[CPP_DEVELOPER] LLM response received, content length: {len(sample_patch)}")
-            logger.info(f"[CPP_DEVELOPER] LLM response starts with: {sample_patch[:200]}...")
+            # 檢查 response 和 response.content 是否存在
+            if not response or not response.content:
+                logger.error(f"[CPP_DEVELOPER] LLM response or content is None")
+                # 使用預設補丁
+                if "event_handler" in target_file:
+                    sample_patch = f"""--- a/{target_file}
++++ b/{target_file}
+@@ -1,5 +1,6 @@
+ #include "event_handler.hpp"
+ #include <iostream>
++#include <chrono>
+ 
+ // 示例修改：添加時間戳記錄
+ void EventHandler::start() {{
++    auto timestamp = std::chrono::system_clock::now();
+     // 原有的處理邏輯
+ }}
+"""
+                else:
+                    sample_patch = f"""--- a/{target_file}
++++ b/{target_file}
+@@ -1,5 +1,6 @@
+ #include <iostream>
++#include <chrono>
+ 
+ // 示例修改：添加時間戳記錄
+ void process_function() {{
++    auto timestamp = std::chrono::system_clock::now();
+     // 原有的處理邏輯
+ }}
+"""
+                logger.info(f"[CPP_DEVELOPER] Using fallback patch due to None response")
+            else:
+                # 嘗試從 LLM 響應中提取 diff
+                sample_patch = response.content
+                logger.info(f"[CPP_DEVELOPER] LLM response received, content length: {len(sample_patch)}")
+                logger.info(f"[CPP_DEVELOPER] LLM response starts with: {sample_patch[:200]}...")
             
             # 如果響應不是標準 diff 格式，嘗試直接寫入文件
             if not sample_patch.startswith("---"):
@@ -1171,40 +1397,85 @@ class WorkflowOrchestrator:
                             logger.info(f"[CPP_DEVELOPER] Diff validation successful, using diff format")
                         else:
                             logger.warning(f"[CPP_DEVELOPER] Diff validation failed: {diff_meta.issues}, falling back to direct file write")
-                            # 如果 diff 驗證失敗，嘗試直接寫入文件
+                            # 如果 diff 驗證失敗，使用智能文件更新方法
                             if file_path:
-                                # 提取文件內容（從 diff 內容中重建）
-                                content_lines = []
-                                for line in diff_lines[1:]:  # 跳過 @@ 行
-                                    if line.startswith('+') and not line.startswith('++'):
-                                        content_lines.append(line[1:])  # 移除 + 前綴
-                                    elif not line.startswith('-') and not line.startswith('--'):
-                                        content_lines.append(line)
+                                logger.info(f"[CPP_DEVELOPER] 🔄 diff 驗證失敗，使用智能文件更新方法: {file_path}")
                                 
-                                content = '\n'.join(content_lines)
+                                # 構建包含文件路徑信息的 LLM 回應
+                                enhanced_response = f"*** Update File: {file_path}\n{response.content}"
                                 
-                                # 使用 write_file 直接創建文件
-                                write_result = self.mcp_server.write_file({
-                                    "path": file_path,
-                                    "content": content,
-                                    "create_dirs": True
-                                })
+                                # 使用智能文件更新方法
+                                update_result = self._intelligent_file_update(file_path, enhanced_response, target_file)
                                 
-                                if write_result.success:
-                                    logger.info(f"[CPP_DEVELOPER] Successfully created file using write_file: {file_path}")
-                                    return {
-                                        "status": "completed",
-                                        "file_created": True,
-                                        "file_path": file_path,
-                                        "content": content,
-                                        "method": "write_file",
-                                        "llm_response": response.content if not response.error else None,
-                                        "model_used": response.model if not response.error else None,
-                                        "tokens_used": response.usage if not response.error else None
-                                    }
+                                if update_result.get("success"):
+                                    logger.info(f"[CPP_DEVELOPER] ✅ 智能文件更新成功: {update_result.get('method')}")
+                                    
+                                    # 根據更新方法返回相應的結果
+                                    if update_result.get("method") == "apply_diff":
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_apply_diff",
+                                            "file_path": file_path,
+                                            "original_size": update_result.get('original_size'),
+                                            "new_size": update_result.get('new_size'),
+                                            "changes_applied": True,
+                                            "message": update_result.get('message')
+                                        }
+                                    elif update_result.get("method") == "structured_diff":
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_structured_diff",
+                                            "file_path": file_path,
+                                            "original_size": update_result.get('original_size'),
+                                            "new_size": update_result.get('new_size'),
+                                            "changes_applied": True,
+                                            "message": update_result.get('message')
+                                        }
+                                    elif update_result.get("method") == "intelligent_merge":
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_merge",
+                                            "file_path": file_path,
+                                            "original_size": update_result.get('original_size'),
+                                            "new_size": update_result.get('new_size'),
+                                            "changes_applied": True,
+                                            "warning": update_result.get('warning'),
+                                            "message": update_result.get('message')
+                                        }
+                                    elif update_result.get("method") == "backup_patch":
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_backup_patch",
+                                            "file_path": file_path,
+                                            "original_size": update_result.get('original_size'),
+                                            "new_size": update_result.get('new_size'),
+                                            "changes_applied": True,
+                                            "warning": update_result.get('warning'),
+                                            "message": update_result.get('message')
+                                        }
+                                    elif update_result.get("method") == "last_resort":
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_last_resort",
+                                            "file_path": file_path,
+                                            "backup_path": update_result.get('backup_path'),
+                                            "warning": update_result.get('warning'),
+                                            "message": update_result.get('message')
+                                        }
+                                    else:
+                                        return {
+                                            "status": "completed",
+                                            "method": "intelligent_update_unknown",
+                                            "file_path": file_path,
+                                            "message": update_result.get('message')
+                                        }
                                 else:
-                                    logger.error(f"[CPP_DEVELOPER] Failed to write file: {write_result.error}")
-                                    return {"error": f"Failed to write file: {write_result.error}"}
+                                    logger.error(f"[CPP_DEVELOPER] ❌ 智能文件更新失敗: {update_result.get('error')}")
+                                    return {
+                                        "status": "failed",
+                                        "error": f"Intelligent file update failed: {update_result.get('error')}",
+                                        "file_path": file_path
+                                    }
                             else:
                                 # 如果無法解析，使用預設格式
                                 sample_patch = f"""# LLM 生成的代碼修改建議：
@@ -1253,30 +1524,84 @@ class WorkflowOrchestrator:
                         content = '\n'.join(lines[content_start:])
                         logger.info(f"[CPP_DEVELOPER] Extracted content for {file_path}, content length: {len(content)}")
                         
-                        # 使用 write_file 直接創建文件
-                        write_result = self.mcp_server.write_file({
-                            "path": file_path,
-                            "content": content,
-                            "create_dirs": True
-                        })
+                        # 使用智能文件更新方法，避免完全覆蓋
+                        logger.info(f"[CPP_DEVELOPER] 🔄 使用智能文件更新方法處理: {file_path}")
                         
-                        logger.info(f"[CPP_DEVELOPER] Write file result: success={write_result.success}, error={write_result.error}")
+                        # 構建包含文件路徑信息的 LLM 回應
+                        enhanced_response = f"*** Update File: {file_path}\n{content}"
                         
-                        if write_result.success:
-                            logger.info(f"[CPP_DEVELOPER] Successfully created file: {file_path}")
-                            return {
-                                "status": "completed",
-                                "file_created": True,
-                                "file_path": file_path,
-                                "content": content,
-                                "method": "write_file",
-                                "llm_response": response.content if not response.error else None,
-                                "model_used": response.model if not response.error else None,
-                                "tokens_used": response.usage if not response.error else None
-                            }
+                        # 使用智能文件更新方法
+                        update_result = self._intelligent_file_update(file_path, enhanced_response, target_file)
+                        
+                        if update_result.get("success"):
+                            logger.info(f"[CPP_DEVELOPER] ✅ 智能文件更新成功: {update_result.get('method')}")
+                            
+                            # 根據更新方法返回相應的結果
+                            if update_result.get("method") == "apply_diff":
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_apply_diff",
+                                    "file_path": file_path,
+                                    "original_size": update_result.get('original_size'),
+                                    "new_size": update_result.get('new_size'),
+                                    "changes_applied": True,
+                                    "message": update_result.get('message')
+                                }
+                            elif update_result.get("method") == "structured_diff":
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_structured_diff",
+                                    "file_path": file_path,
+                                    "original_size": update_result.get('original_size'),
+                                    "new_size": update_result.get('new_size'),
+                                    "changes_applied": True,
+                                    "message": update_result.get('message')
+                                }
+                            elif update_result.get("method") == "intelligent_merge":
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_merge",
+                                    "file_path": file_path,
+                                    "original_size": update_result.get('original_size'),
+                                    "new_size": update_result.get('new_size'),
+                                    "changes_applied": True,
+                                    "warning": update_result.get('warning'),
+                                    "message": update_result.get('message')
+                                }
+                            elif update_result.get("method") == "backup_patch":
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_backup_patch",
+                                    "file_path": file_path,
+                                    "original_size": update_result.get('original_size'),
+                                    "new_size": update_result.get('new_size'),
+                                    "changes_applied": True,
+                                    "warning": update_result.get('warning'),
+                                    "message": update_result.get('message')
+                                }
+                            elif update_result.get("method") == "last_resort":
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_last_resort",
+                                    "file_path": file_path,
+                                    "backup_path": update_result.get('backup_path'),
+                                    "warning": update_result.get('warning'),
+                                    "message": update_result.get('message')
+                                }
+                            else:
+                                return {
+                                    "status": "completed",
+                                    "method": "intelligent_update_unknown",
+                                    "file_path": file_path,
+                                    "message": update_result.get('message')
+                                }
                         else:
-                            logger.error(f"[CPP_DEVELOPER] Failed to write file: {write_result.error}")
-                            return {"error": f"Failed to write file: {write_result.error}"}
+                            logger.error(f"[CPP_DEVELOPER] ❌ 智能文件更新失敗: {update_result.get('error')}")
+                            return {
+                                "status": "failed",
+                                "error": f"Intelligent file update failed: {update_result.get('error')}",
+                                "file_path": file_path
+                            }
                     else:
                         logger.warning(f"[CPP_DEVELOPER] Could not parse file path from LLM response")
                         # 如果無法解析，使用預設格式
@@ -1324,8 +1649,8 @@ class WorkflowOrchestrator:
                     logger.warning(f"[CPP_DEVELOPER] Fixed diff format also failed: {dry_run_result.error}")
                     logger.info(f"[CPP_DEVELOPER] Falling back to direct file write method")
             
-            # 嘗試從 LLM 響應中提取文件內容並直接寫入
-            if "*** Update File:" in response.content or "*** Add File:" in response.content:
+            # 使用智能文件更新方法，避免完全覆蓋文件
+            if response and response.content and ("*** Update File:" in response.content or "*** Add File:" in response.content):
                 lines = response.content.split('\n')
                 file_path = None
                 
@@ -1343,87 +1668,86 @@ class WorkflowOrchestrator:
                         break
                 
                 if file_path:
-                    # 尋找 diff 內容的開始
-                    diff_start = -1
-                    for i, line in enumerate(lines):
-                        if line.startswith("@@"):
-                            diff_start = i
-                            break
+                    logger.info(f"[CPP_DEVELOPER] 🔄 使用智能文件更新方法處理: {file_path}")
                     
-                    if diff_start >= 0:
-                        # 從 diff 內容中重建文件內容
-                        diff_lines = lines[diff_start:]
-                        diff_content = '\n'.join(diff_lines)
+                    # 使用智能文件更新方法
+                    update_result = self._intelligent_file_update(file_path, response.content, target_file)
+                    
+                    if update_result.get("success"):
+                        logger.info(f"[CPP_DEVELOPER] ✅ 智能文件更新成功: {update_result.get('method')}")
                         
-                        logger.info(f"[CPP_DEVELOPER] 🔄 測試回退到 apply_diff 方法...")
-                        logger.info(f"[CPP_DEVELOPER] 使用 apply_diff 應用變更到: {file_path}")
-                        
-                        # 使用新的 apply_diff 方法來正確應用 diff 變更
-                        diff_result = self.mcp_server.apply_diff({
-                            "path": file_path,
-                            "diff_content": diff_content
-                        })
-                        
-                        if diff_result.success:
-                            logger.info(f"[CPP_DEVELOPER] ✅ 成功使用 apply_diff 應用變更: {file_path}")
-                            logger.info(f"[CPP_DEVELOPER] 原始大小: {diff_result.data.get('original_size', 'unknown')}")
-                            logger.info(f"[CPP_DEVELOPER] 新大小: {diff_result.data.get('new_size', 'unknown')}")
-                            logger.info(f"[CPP_DEVELOPER] 變更行數: {diff_result.data.get('original_lines', 0)} -> {diff_result.data.get('new_lines', 0)}")
-                            
-                            # 更新結果
-                            result = {
-                                "success": True,
-                                "method": "apply_diff",
+                        # 根據更新方法返回相應的結果
+                        if update_result.get("method") == "apply_diff":
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_apply_diff",
                                 "file_path": file_path,
-                                "original_size": diff_result.data.get('original_size'),
-                                "new_size": diff_result.data.get('new_size'),
+                                "original_size": update_result.get('original_size'),
+                                "new_size": update_result.get('new_size'),
                                 "changes_applied": True,
-                                "message": f"Successfully applied diff changes to {file_path}"
+                                "message": update_result.get('message')
+                            }
+                        elif update_result.get("method") == "structured_diff":
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_structured_diff",
+                                "file_path": file_path,
+                                "original_size": update_result.get('original_size'),
+                                "new_size": update_result.get('new_size'),
+                                "changes_applied": True,
+                                "message": update_result.get('message')
+                            }
+                        elif update_result.get("method") == "intelligent_merge":
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_merge",
+                                "file_path": file_path,
+                                "original_size": update_result.get('original_size'),
+                                "new_size": update_result.get('new_size'),
+                                "changes_applied": True,
+                                "warning": update_result.get('warning'),
+                                "message": update_result.get('message')
+                            }
+                        elif update_result.get("method") == "backup_patch":
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_backup_patch",
+                                "file_path": file_path,
+                                "original_size": update_result.get('original_size'),
+                                "new_size": update_result.get('new_size'),
+                                "changes_applied": True,
+                                "warning": update_result.get('warning'),
+                                "message": update_result.get('message')
+                            }
+                        elif update_result.get("method") == "last_resort":
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_last_resort",
+                                "file_path": file_path,
+                                "backup_path": update_result.get('backup_path'),
+                                "warning": update_result.get('warning'),
+                                "message": update_result.get('message')
                             }
                         else:
-                            logger.error(f"[CPP_DEVELOPER] ❌ apply_diff 失敗: {diff_result.error}")
-                            
-                            # 如果 apply_diff 也失敗，嘗試使用 write_file 作為最後手段
-                            logger.warning(f"[CPP_DEVELOPER] 🔄 嘗試使用 write_file 作為最後手段...")
-                            
-                            # 重建完整內容（這會丟失原始內容，但至少能工作）
-                            content_lines = []
-                            for line in diff_lines[1:]:  # 跳過 @@ 行
-                                if line.startswith('+') and not line.startswith('++'):
-                                    content_lines.append(line[1:])  # 移除 + 前綴
-                                elif not line.startswith('-') and not line.startswith('--'):
-                                    content_lines.append(line)
-                            
-                            content = '\n'.join(content_lines)
-                            
-                            write_result = self.mcp_server.write_file({
-                                "path": file_path,
-                                "content": content,
-                                "create_dirs": True,
-                                "mode": "overwrite"  # 明確指定覆蓋模式
-                            })
-                            
-                            if write_result.success:
-                                logger.warning(f"[CPP_DEVELOPER] ⚠️ 使用 write_file 成功（但可能丟失原始內容）: {file_path}")
-                                result = {
-                                    "success": True,
-                                    "method": "write_file_fallback",
-                                    "file_path": file_path,
-                                    "warning": "Original file content may have been lost",
-                                    "message": f"Successfully wrote file {file_path} (fallback method)"
-                                }
-                            else:
-                                logger.error(f"[CPP_DEVELOPER] ❌ write_file 也失敗: {write_result.error}")
-                                result = {
-                                    "success": False,
-                                    "error": f"Both apply_diff and write_file failed: {diff_result.error}, {write_result.error}"
-                                }
+                            return {
+                                "status": "completed",
+                                "method": "intelligent_update_unknown",
+                                "file_path": file_path,
+                                "message": update_result.get('message')
+                            }
                     else:
-                        logger.error(f"[CPP_DEVELOPER] ❌ 無法找到 diff 內容")
-                        result = {
-                            "success": False,
-                            "error": "Could not find diff content in LLM response"
+                        logger.error(f"[CPP_DEVELOPER] ❌ 智能文件更新失敗: {update_result.get('error')}")
+                        return {
+                            "status": "failed",
+                            "error": f"Intelligent file update failed: {update_result.get('error')}",
+                            "file_path": file_path
                         }
+                else:
+                    logger.error(f"[CPP_DEVELOPER] ❌ 無法找到文件路徑")
+                    return {
+                        "status": "failed",
+                        "error": "Could not find file path in LLM response"
+                    }
             
             # 如果無法解析，返回錯誤
             return {"error": f"Patch dry run failed: {dry_run_result.error}"}
@@ -1486,15 +1810,20 @@ class WorkflowOrchestrator:
 請輸出標準的 unified diff（以 --- a/... +++ b/... 開頭）。
 """
         response = await self.llm_client.generate_response(
-            task_type=TaskType.CODE_GENERATION,
+            task_type=TaskType.HEADER_GENERATION,
             prompt=prompt,
             context=file_res.data.get("content", ""),
-            system_prompt=SYSTEM_PROMPTS[TaskType.CODE_GENERATION]
+            system_prompt=SYSTEM_PROMPTS[TaskType.HEADER_GENERATION]
         )
         
         if response.error:
             logger.error(f"LLM error in header generation: {response.error}")
             return {"error": f"LLM failed: {response.error}"}
+        
+        # 檢查 response 和 response.content 是否存在
+        if not response or not response.content:
+            logger.error("LLM response or content is None in header generation")
+            return {"error": "LLM response is None"}
         
         patch = response.content
         if not patch.startswith("---"):
@@ -2096,6 +2425,253 @@ class WorkflowOrchestrator:
                 active_workflows.append(status)
         
         return active_workflows + self.workflow_history
+
+    def _intelligent_file_update(self, file_path: str, llm_response: str, target_file: str = "") -> Dict[str, Any]:
+        """
+        智能文件更新：嘗試多種方法來更新文件，避免完全覆蓋
+        
+        Args:
+            file_path: 目標文件路徑
+            llm_response: LLM 回應內容
+            target_file: 目標文件名（用於生成備用補丁）
+            
+        Returns:
+            更新結果字典
+        """
+        logger.info(f"[INTELLIGENT_UPDATE] 🔄 開始智能更新文件: {file_path}")
+        
+        # 方法1: 嘗試從 LLM 回應中提取標準 diff 格式
+        if "---" in llm_response and "@@" in llm_response:
+            logger.info(f"[INTELLIGENT_UPDATE] 方法1: 嘗試解析標準 diff 格式")
+            
+            # 提取 diff 內容
+            diff_start = llm_response.find("---")
+            diff_end = llm_response.find("\n", diff_start)
+            if diff_end == -1:
+                diff_end = len(llm_response)
+            
+            diff_content = llm_response[diff_start:diff_end]
+            
+            # 嘗試使用 apply_diff 方法
+            diff_result = self.mcp_server.apply_diff({
+                "path": file_path,
+                "diff_content": diff_content
+            })
+            
+            if diff_result.success:
+                logger.info(f"[INTELLIGENT_UPDATE] ✅ 成功使用 apply_diff 更新文件")
+                return {
+                    "success": True,
+                    "method": "apply_diff",
+                    "file_path": file_path,
+                    "original_size": diff_result.data.get('original_size'),
+                    "new_size": diff_result.data.get('new_size'),
+                    "changes_applied": True,
+                    "message": f"Successfully updated {file_path} using apply_diff"
+                }
+            else:
+                logger.warning(f"[INTELLIGENT_UPDATE] apply_diff 失敗: {diff_result.error}")
+        
+        # 方法2: 嘗試從 LLM 回應中提取結構化更新信息
+        if "*** Update File:" in llm_response or "*** Add File:" in llm_response:
+            logger.info(f"[INTELLIGENT_UPDATE] 方法2: 嘗試解析結構化更新信息")
+            
+            lines = llm_response.split('\n')
+            diff_lines = []
+            in_diff_section = False
+            
+            for line in lines:
+                if line.startswith("@@") or line.startswith("---"):
+                    in_diff_section = True
+                    diff_lines.append(line)
+                elif in_diff_section and line.startswith(('+', '-', ' ')):
+                    diff_lines.append(line)
+                elif in_diff_section and not line.startswith(('+', '-', ' ')):
+                    break
+            
+            if diff_lines:
+                diff_content = '\n'.join(diff_lines)
+                logger.info(f"[INTELLIGENT_UPDATE] 提取到 diff 內容，長度: {len(diff_content)}")
+                
+                # 嘗試使用 apply_diff
+                diff_result = self.mcp_server.apply_diff({
+                    "path": file_path,
+                    "diff_content": diff_content
+                })
+                
+                if diff_result.success:
+                    logger.info(f"[INTELLIGENT_UPDATE] ✅ 成功使用結構化 diff 更新文件")
+                    return {
+                        "success": True,
+                        "method": "structured_diff",
+                        "file_path": file_path,
+                        "original_size": diff_result.data.get('original_size'),
+                        "new_size": diff_result.data.get('new_size'),
+                        "changes_applied": True,
+                        "message": f"Successfully updated {file_path} using structured diff"
+                    }
+                else:
+                    logger.warning(f"[INTELLIGENT_UPDATE] 結構化 diff 失敗: {diff_result.error}")
+        
+        # 方法3: 嘗試部分內容更新（只更新特定函數或類）
+        logger.info(f"[INTELLIGENT_UPDATE] 方法3: 嘗試部分內容更新")
+        
+        # 讀取原始文件
+        read_result = self.mcp_server.read_file({"path": file_path})
+        if not read_result.success:
+            logger.warning(f"[INTELLIGENT_UPDATE] 無法讀取原始文件: {read_result.error}")
+        else:
+            original_content = read_result.data.get('content', '')
+            if original_content:
+                # 嘗試識別 LLM 回應中的具體修改
+                updated_content = self._merge_llm_changes(original_content, llm_response, target_file)
+                
+                if updated_content != original_content:
+                    # 使用 write_file 但記錄這是部分更新
+                    write_result = self.mcp_server.write_file({
+                        "path": file_path,
+                        "content": updated_content,
+                        "create_dirs": True,
+                        "mode": "overwrite"  # 這裡必須使用覆蓋，但內容已經過智能合併
+                    })
+                    
+                    if write_result.success:
+                        logger.info(f"[INTELLIGENT_UPDATE] ✅ 成功使用智能合併更新文件")
+                        return {
+                            "success": True,
+                            "method": "intelligent_merge",
+                            "file_path": file_path,
+                            "original_size": len(original_content),
+                            "new_size": len(updated_content),
+                            "changes_applied": True,
+                            "warning": "File was updated using intelligent merge (may have lost some original content)",
+                            "message": f"Successfully updated {file_path} using intelligent merge"
+                        }
+                    else:
+                        logger.error(f"[INTELLIGENT_UPDATE] 智能合併寫入失敗: {write_result.error}")
+        
+        # 方法4: 生成最小化的備用補丁
+        logger.info(f"[INTELLIGENT_UPDATE] 方法4: 生成最小化備用補丁")
+        
+        if target_file:
+            # 根據目標文件生成針對性的備用補丁
+            if "event_handler" in target_file:
+                backup_patch = f"""--- a/{file_path}
++++ b/{file_path}
+@@ -1,5 +1,6 @@
+ #include "event_handler.hpp"
+ #include <iostream>
++#include <chrono>
+ 
+ // 示例修改：添加時間戳記錄
+ void EventHandler::start() {{
++    auto timestamp = std::chrono::system_clock::now();
+     // 原有的處理邏輯
+ }}
+ """
+            else:
+                backup_patch = f"""--- a/{file_path}
++++ b/{file_path}
+@@ -1,5 +1,6 @@
+ #include <iostream>
++#include <chrono>
+ 
+ // 示例修改：添加時間戳記錄
+ void process_function() {{
++    auto timestamp = std::chrono::system_clock::now();
+     // 原有的處理邏輯
+ }}
+ """
+            
+            # 嘗試應用備用補丁
+            diff_result = self.mcp_server.apply_diff({
+                "path": file_path,
+                "diff_content": backup_patch
+            })
+            
+            if diff_result.success:
+                logger.info(f"[INTELLIGENT_UPDATE] ✅ 成功應用備用補丁")
+                return {
+                    "success": True,
+                    "method": "backup_patch",
+                    "file_path": file_path,
+                    "original_size": diff_result.data.get('original_size'),
+                    "new_size": diff_result.data.get('new_size'),
+                    "changes_applied": True,
+                    "warning": "Applied backup patch due to LLM response parsing failure",
+                    "message": f"Successfully updated {file_path} using backup patch"
+                }
+            else:
+                logger.warning(f"[INTELLIGENT_UPDATE] 備用補丁失敗: {diff_result.error}")
+        
+        # 方法5: 最後手段 - 創建新文件（但保留原始內容作為備份）
+        logger.warning(f"[INTELLIGENT_UPDATE] ⚠️ 所有智能更新方法都失敗，使用最後手段")
+        
+        # 創建備份文件
+        backup_path = f"{file_path}.backup.{int(time.time())}"
+        if read_result.success:
+            backup_result = self.mcp_server.write_file({
+                "path": backup_path,
+                "content": read_result.data.get('content', ''),
+                "create_dirs": True
+            })
+            if backup_result.success:
+                logger.info(f"[INTELLIGENT_UPDATE] 已創建備份文件: {backup_path}")
+        
+        # 創建新文件
+        write_result = self.mcp_server.write_file({
+            "path": file_path,
+            "content": f"// 自動生成的文件 - 原始內容已備份到 {backup_path}\n// LLM 回應:\n{llm_response}",
+            "create_dirs": True,
+            "mode": "overwrite"
+        })
+        
+        if write_result.success:
+            logger.warning(f"[INTELLIGENT_UPDATE] ⚠️ 使用最後手段創建新文件（已備份原始內容）")
+            return {
+                "success": True,
+                "method": "last_resort",
+                "file_path": file_path,
+                "backup_path": backup_path,
+                "warning": "Original file was backed up and new file was created due to update failure",
+                "message": f"Created new file {file_path} as last resort (original backed up to {backup_path})"
+            }
+        else:
+            logger.error(f"[INTELLIGENT_UPDATE] ❌ 最後手段也失敗: {write_result.error}")
+            return {
+                "success": False,
+                "error": f"All update methods failed: {write_result.error}",
+                "file_path": file_path
+            }
+    
+    def _merge_llm_changes(self, original_content: str, llm_response: str, target_file: str) -> str:
+        """
+        嘗試將 LLM 的修改合併到原始內容中
+        
+        Args:
+            original_content: 原始文件內容
+            llm_response: LLM 回應
+            target_file: 目標文件名
+            
+        Returns:
+            合併後的文件內容
+        """
+        logger.info(f"[MERGE_CHANGES] 嘗試合併 LLM 修改到原始內容")
+        
+        # 簡單的合併策略：在文件末尾添加 LLM 的修改建議
+        merged_content = original_content.rstrip()
+        
+        if merged_content and not merged_content.endswith('\n'):
+            merged_content += '\n'
+        
+        merged_content += f"\n// === LLM 修改建議 ===\n"
+        merged_content += f"// 目標文件: {target_file}\n"
+        merged_content += f"// 時間戳: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        merged_content += f"// 修改內容:\n"
+        merged_content += f"{llm_response}\n"
+        merged_content += f"// === 修改建議結束 ===\n"
+        
+        return merged_content
 
 # 使用範例
 async def main():

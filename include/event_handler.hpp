@@ -67,6 +67,14 @@ struct IntegrityKeyHash {
     }
 };
 
+// 新增：可執行頁面資訊結構
+struct ExecPageInfo {
+    DWORD last_protect;
+    uint64_t first_seen_ts;
+    uint64_t last_transition_ts;
+    bool seen_exec;
+};
+
 // 可疑頁面條目
 struct SuspiciousEntry {
     SuspiciousKey key;
@@ -200,6 +208,8 @@ struct Event {
     }
 };
 
+
+
 // 事件統計結構
 struct EventStats {
     std::atomic<uint64_t> events_in{0};
@@ -233,25 +243,27 @@ struct ProcessHandleInfo {
 
 // 擴展的 Event 處理器類別
 // EventHandler no longer inherits MemoryMonitor to avoid dual-run race conditions.
-class EventHandler: public RealMemoryDetection::MemoryMonitor {
+class EventHandler {
 public:
+    // 構造函數和析構函數
     EventHandler();
     EventHandler(const MemoryMonitorConfig& config);
     ~EventHandler();
-
-    // 基本操作
+    
+    // 友元函數聲明
+    friend void enroll_and_schedule_attack_simulators(RealMemoryDetection::EventHandler* self);
+    
+    // 啟動和停止
     void start();
     void stop();
-    void enqueue_event(const Event& ev);
-    void schedule_suspicious_region(DWORD pid, uint64_t address);
-    
+
     // 新增：事件驅動架構接口
     bool push_raw_event(const RawEvent& raw_event);
     bool push_raw_events(const std::vector<RawEvent>& raw_events);
     const RawEventMPSCRingBuffer::Stats& get_raw_event_stats() const;
     
     // 新增：設置依賴項
-    void set_memory_monitor(MemoryMonitor* monitor);
+    void set_memory_monitor(RealMemoryDetection::MemoryMonitor* monitor);
     void set_detection_engine(void* engine); // 使用 void* 避免循環依賴
     void log_to_detection_engine(const std::string& level, const std::string& message);
     
@@ -260,74 +272,15 @@ public:
     void schedule_comprehensive_detection();
     void schedule_status_output();
     void schedule_cycle_completion();
+    // expose enqueue and scheduling APIs for external callers
+    void enqueue_event(const Event& ev);
+    void schedule_suspicious_region(DWORD pid, uint64_t address);
     
     // 新增：統計和監控
     const EventStats& get_stats() const { return stats_; }
-
-private:
-    // generation counter to drop stale events when handler is recreated
-    std::atomic<uint32_t> handler_generation_{1};
-
-    // 原有成員
-    std::mutex event_mutex_;
-    std::condition_variable event_cv_;
-    std::deque<Event> event_queue_;
-    std::deque<Event> high_priority_queue_; // 新增高優先級佇列
-    size_t fast_batch_size_ = 128;
-    int fast_interval_ms_ = 50;
-
-    // 改良的可疑區域管理
-    std::mutex suspicious_mutex_;
-    std::deque<SuspiciousKey> suspicious_regions_;
-    std::unordered_set<SuspiciousKey, SuspiciousKeyHash> suspicious_set_;
-    std::unordered_map<SuspiciousKey, std::chrono::steady_clock::time_point, SuspiciousKeyHash> suspicious_last_seen_;
-    size_t deferred_batch_limit_ = 200;
-    std::chrono::seconds deferred_interval_ = std::chrono::seconds(1);
-    std::chrono::seconds suspicious_cooldown_ = std::chrono::seconds(5);
-    size_t max_suspicious_queue_ = 5000;
-
-    // 進程句柄快取
-    std::mutex process_handle_mutex_;
-    std::unordered_map<DWORD, ProcessHandleInfo> process_handle_cache_;
-
-    // 完整性檢查重複計數
-    std::mutex integrity_mutex_;
-    std::unordered_map<std::pair<DWORD, uint64_t>, uint8_t, IntegrityKeyHash> integrity_recheck_count_;
     
-    // 新增：可執行頁面追蹤器
-    struct ExecPageInfo {
-        DWORD last_protect;
-        uint64_t first_seen_ts;
-        uint64_t last_transition_ts;
-        bool seen_exec;
-    };
-    std::mutex exec_pages_mutex_;
-    std::unordered_map<ExecKey, ExecPageInfo, ExecKeyHash> exec_pages_;
-    
-    // 新增：watchlist
-    std::unordered_set<uint64_t> forced_watch_;
-    std::mutex watch_mtx_;
-
-    std::thread fast_event_thread_;
-    std::thread deferred_analyzer_thread_;
-    std::atomic<bool> running_;
-    std::atomic<bool> shutting_down_{false}; // 防止析構後外部調用
-    
-    // 新增：定時調度線程
-    std::thread scheduler_thread_;
-    std::atomic<bool> scheduler_running_;
-    
-    // 新增：依賴項
-    MemoryMonitor* memory_monitor_;
-    void* detection_engine_; // 使用 void* 避免循環依賴
-    
-    // 新增：計數器和狀態
-    std::atomic<int> status_tick_counter_{0};
-    std::atomic<int> comprehensive_tick_counter_{0};
-    std::atomic<int> total_detections_{0};
-    
-    // 新增：統計
-    EventStats stats_;
+    // 深度掃描方法 - 需要從外部調用
+    void deep_scan_process(DWORD process_id);
     
     // 新增：定時器
     std::chrono::steady_clock::time_point last_scan_time_;
@@ -342,15 +295,12 @@ private:
     const std::chrono::seconds cycle_interval_ = std::chrono::seconds(60); // 縮短到60秒
     int max_regions_to_scan_ = 10;
 
-protected:
-    // Methods matching MemoryMonitor interface. Keep them virtual so a derived class
-    // that also inherits MemoryMonitor can satisfy the pure virtual requirements.
-    void deep_scan_process(DWORD process_id) override;
-    virtual void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
-    virtual void detect_attack_simulator_patterns(DWORD process_id, HANDLE hProcess);
-    virtual void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess);
-    virtual void detect_complex_attack_patterns(DWORD process_id, HANDLE hProcess);
-    virtual void detect_suspicious_behavior_patterns(DWORD process_id, HANDLE hProcess);
+    // Methods matching MemoryMonitor interface - now as regular methods
+    void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, MemoryDetectionEngine::ProcessCategory category);
+    void detect_attack_simulator_patterns(DWORD process_id, HANDLE hProcess);
+    void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess);
+    void detect_complex_attack_patterns(DWORD process_id, HANDLE hProcess);
+    void detect_suspicious_behavior_patterns(DWORD process_id, HANDLE hProcess);
 
     // 原有方法
 private:
@@ -396,14 +346,76 @@ private:
     void update_stats_on_drop(bool is_high_priority);
     void update_stats_on_finding();
     void update_stats_on_scan();
-    
-    // 新增：watchlist 功能
     void add_exec_watch(uint64_t addr);
     
     // 新增：事件驅動架構相關
     RawEventMPSCRingBuffer raw_event_buffer_;
     std::thread real_time_ingest_thread_;
     std::atomic<bool> ingest_running_;
+
+    // ====== 補齊缺失的內部狀態 ======
+    std::atomic<bool> running_{false};
+    std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> scheduler_running_{false};
+    
+    // 世代計數器
+    std::atomic<uint64_t> handler_generation_{0};
+    
+    // 執行緒
+    std::thread fast_event_thread_;
+    std::thread deferred_analyzer_thread_;  
+    std::thread scheduler_thread_;
+    
+    // 事件佇列和同步
+    std::deque<Event> event_queue_;
+    std::deque<Event> high_priority_queue_;
+    std::mutex event_mutex_;  // 與 cpp 中使用的名稱一致
+    std::mutex event_queue_mutex_;
+    std::condition_variable event_cv_;
+    
+    // 快速事件處理配置
+    size_t fast_batch_size_ = 128;
+    int fast_interval_ms_ = 50;
+    
+    // 可疑區域管理配置
+    size_t deferred_batch_limit_ = 200;
+    std::chrono::seconds deferred_interval_ = std::chrono::seconds(1);
+    std::chrono::seconds suspicious_cooldown_ = std::chrono::seconds(5);
+    size_t max_suspicious_queue_ = 5000;
+    
+    // 進程句柄快取
+    std::unordered_map<DWORD, ProcessHandleInfo> process_handle_cache_;
+    std::mutex process_handle_mutex_;
+    
+    // 可疑區域管理
+    std::mutex suspicious_mutex_;
+    std::deque<SuspiciousKey> suspicious_regions_;
+    std::unordered_set<SuspiciousKey, SuspiciousKeyHash> suspicious_set_;
+    std::unordered_map<SuspiciousKey, std::chrono::steady_clock::time_point, SuspiciousKeyHash> suspicious_last_seen_;
+    
+    // 可執行頁面追蹤
+    std::mutex exec_pages_mutex_;
+    std::unordered_map<ExecKey, ExecPageInfo, ExecKeyHash> exec_pages_;
+    
+    // watchlist
+    std::unordered_set<uint64_t> forced_watch_;
+    std::mutex watch_mtx_;
+    
+    // 完整性檢查計數
+    std::mutex integrity_mutex_;
+    std::unordered_map<std::pair<DWORD, uint64_t>, uint8_t, IntegrityKeyHash> integrity_recheck_count_;
+    
+    // 依賴指針
+    RealMemoryDetection::MemoryMonitor* memory_monitor_ = nullptr;
+    void* detection_engine_ = nullptr;
+
+    // 計數器和統計
+    std::atomic<uint32_t> status_tick_counter_{0};
+    std::atomic<uint32_t> comprehensive_tick_counter_{0};
+    std::atomic<uint64_t> total_detections_{0};
+    
+    // EventHandler 專用統計
+    EventStats stats_;
     
     // 新增：實時事件攝取方法
     void real_time_ingest_loop();

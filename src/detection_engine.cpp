@@ -2665,15 +2665,35 @@ public:
             // 初始化 EventHandler
             event_handler_ = std::make_unique<EventHandler>(config);
             
-            // 設置違規回調
-            event_handler_->set_violation_callback([this](AttackType type, uint64_t address, 
-                                                          const std::string& description, double confidence, DWORD process_id) {
-                this->report_attack(type, address, description, confidence, process_id);
-            });
+            // 設置違規回調 - 現在通過 EventHandler 的 MemoryMonitor 實例
+            // 注意：這個回調會在 MemoryMonitor 創建後設置
         
             
             // 啟動 EventHandler 並設置依賴項
-            event_handler_->set_memory_monitor(event_handler_.get());
+            // 修正：創建一個獨立的 MemoryMonitor 實例，避免循環引用
+            auto* memory_monitor = new RealMemoryDetection::MemoryMonitor();
+            // 啟動 MemoryMonitor
+            if (!memory_monitor->start()) {
+                log_important("Failed to start MemoryMonitor");
+                delete memory_monitor;
+                return false;
+            }
+            log_important("MemoryMonitor started successfully");
+            
+            // 設置深度掃描回調，讓 MemoryMonitor 調用 EventHandler 的方法
+            memory_monitor->set_deep_scan_callback([this](DWORD process_id) {
+                if (event_handler_) {
+                    event_handler_->deep_scan_process(process_id);
+                }
+            });
+            
+            // 設置違規回調
+            memory_monitor->set_violation_callback([this](AttackType type, uint64_t address, 
+                                                          const std::string& description, double confidence, DWORD process_id) {
+                this->report_attack(type, address, description, confidence, process_id);
+            });
+            
+            event_handler_->set_memory_monitor(memory_monitor);
             event_handler_->set_detection_engine(this);
             log_important("starting event handler");
             event_handler_->start();

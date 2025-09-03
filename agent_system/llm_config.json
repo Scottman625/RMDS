@@ -19,15 +19,24 @@
     "presence_penalty": 0.0,
     "description": "任務分解 - 使用 Claude 進行邏輯分析和規劃"
   },
-  "code_generation": {
+  "header_generation": {
     "provider": "openai",
     "model": "gpt-5-mini",
-    "max_tokens": 25000,
+    "max_tokens": 15000,
     "temperature": 0.1,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
-    "description": "代碼生成 - 使用 GPT-4 進行高質量代碼生成"
+    "description": "頭文件生成 - 使用 GPT-5 進行頭文件接口生成"
+  },
+  "cpp_generation": {
+    "provider": "openai",
+    "model": "gpt-5",
+    "max_tokens": 30000,
+    "top_p": 0.9,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "description": "C++ 代碼生成 - 使用 GPT-5 進行高質量 C++ 代碼生成"
   },
   "code_review": {
     "provider": "anthropic",

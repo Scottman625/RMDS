@@ -46,7 +46,8 @@ class TaskType(Enum):
     """任務類型"""
     REQUIREMENT_ANALYSIS = "requirement_analysis"
     TASK_DECOMPOSITION = "task_decomposition"
-    CODE_GENERATION = "code_generation"
+    HEADER_GENERATION = "header_generation"
+    CPP_GENERATION = "cpp_generation"
     CODE_REVIEW = "code_review"
     TEST_GENERATION = "test_generation"
     QUALITY_ASSESSMENT = "quality_assessment"
@@ -101,11 +102,19 @@ class LLMClient:
                 temperature=0.1
             ),
             
-            # 代碼生成 - 使用 GPT-4 (代碼生成能力強)
-            TaskType.CODE_GENERATION: LLMConfig(
+            # 頭文件生成 - 使用 GPT-5 (頭文件接口生成)
+            TaskType.HEADER_GENERATION: LLMConfig(
                 provider=LLMProvider.OPENAI,
-                model="gpt-4-turbo-preview",
-                max_tokens=6000,
+                model="gpt-5-mini",
+                max_tokens=15000,
+                temperature=0.1
+            ),
+            
+            # C++ 代碼生成 - 使用 GPT-5 (代碼生成能力強)
+            TaskType.CPP_GENERATION: LLMConfig(
+                provider=LLMProvider.OPENAI,
+                model="gpt-5-mini",
+                max_tokens=25000,
                 temperature=0.1
             ),
             
@@ -295,19 +304,19 @@ class LLMClient:
         if "gpt-5" in kwargs["model"] or "gpt-4o" in kwargs["model"]:
             completion_params["max_completion_tokens"] = kwargs["max_tokens"]
             
-            # gpt-5-mini 模型不支持自定義 temperature，只支持默認值
-            if "gpt-5-mini" in kwargs["model"]:
+            # gpt-5 和 gpt-5-mini 模型不支持自定義 temperature，只支持默認值
+            if "gpt-5" in kwargs["model"]:
                 # 不設置 temperature 參數，使用默認值
                 pass
             else:
-                # 其他 gpt-5 模型可以設置 temperature
+                # 其他 gpt-4o 模型可以設置 temperature
                 completion_params["temperature"] = kwargs["temperature"]
         else:
             completion_params["max_tokens"] = kwargs["max_tokens"]
             completion_params["temperature"] = kwargs["temperature"]
         
         # 添加其他參數（如果模型支持）
-        if "gpt-5-mini" not in kwargs["model"]:
+        if "gpt-5" not in kwargs["model"]:
             completion_params["top_p"] = kwargs["top_p"]
             completion_params["frequency_penalty"] = kwargs["frequency_penalty"]
             completion_params["presence_penalty"] = kwargs["presence_penalty"]
@@ -420,7 +429,21 @@ SYSTEM_PROMPTS = {
 - 依賴關係正確
 - 風險評估充分""",
 
-    TaskType.CODE_GENERATION: """你是一個資深的 C++ 開發者，專門為 RMDS (Runtime Memory Detection System) 專案開發代碼。
+    TaskType.HEADER_GENERATION: """你是一個資深的 C++ 頭文件設計師，專門為 RMDS (Runtime Memory Detection System) 專案生成頭文件。
+你的任務是：
+1. 分析 C++ 源代碼
+2. 設計清晰的類和函數接口
+3. 生成標準的頭文件 (.hpp/.h)
+4. 確保接口設計合理
+
+請注意：
+- 使用適當的 include guard 或 #pragma once
+- 正確的前向聲明 (forward declarations)
+- 清晰的類和函數聲明
+- 適當的 const 修飾符
+- 生成統一的 diff 格式""",
+
+    TaskType.CPP_GENERATION: """你是一個資深的 C++ 開發者，專門為 RMDS (Runtime Memory Detection System) 專案開發代碼。
 你的任務是：
 1. 理解需求描述
 2. 分析現有代碼結構
