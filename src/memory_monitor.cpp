@@ -1,4 +1,6 @@
 #include "../include/memory_detection_monitor.hpp"
+#include "../include/event_utils.hpp"
+#include "../include/utils/process_lists.hpp"
 #include <iostream>
 #include <sstream>
 #include <iomanip>
@@ -14,6 +16,7 @@
 #include <windows.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
+#undef min // Prevent macro conflict with std::min
 
 namespace RealMemoryDetection {
 
@@ -63,7 +66,9 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     , heap_monitoring_enabled_(config.enable_heap_monitoring)
     , stack_monitoring_enabled_(config.enable_stack_monitoring)
     , executable_monitoring_enabled_(config.enable_executable_monitoring)
-    , shared_memory_monitoring_enabled_(config.enable_shared_memory_monitoring) {
+    , shared_memory_monitoring_enabled_(config.enable_shared_memory_monitoring)
+    , violation_callback_(nullptr)
+    , deep_scan_callback_(nullptr) {
     
     // 初始化統計
     stats_.total_scans = 0;
@@ -85,6 +90,7 @@ MemoryMonitor::MemoryMonitor(const MemoryMonitorConfig& config)
     log_file_.open(config_.log_file, std::ios::app);
 }
 
+// 實現析構函數
 MemoryMonitor::~MemoryMonitor() {
     stop();
     if (log_file_.is_open()) {
@@ -117,6 +123,10 @@ bool MemoryMonitor::is_running() const {
 
 void MemoryMonitor::set_violation_callback(MemoryViolationCallback callback) {
     violation_callback_ = callback;
+}
+
+void MemoryMonitor::set_deep_scan_callback(DeepScanCallback callback) {
+    deep_scan_callback_ = callback;
 }
 
 // 進程分類
@@ -173,34 +183,135 @@ void MemoryMonitor::monitor_loop() {
     }
 }
 
-// 掃描進程
-void MemoryMonitor::scan_processes() {
-    DWORD processes[4096];
-    DWORD cbNeeded;
+// // 掃描進程
+// void MemoryMonitor::scan_processes() {
+//     DWORD processes[4096];
+//     DWORD cbNeeded;
     
-    if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
-        DWORD num_processes = cbNeeded / sizeof(DWORD);
+//     if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+//         DWORD num_processes = cbNeeded / sizeof(DWORD);
+//         log_message("DEBUG", "[SCAN] 發現 " + std::to_string(num_processes) + " 個進程，將掃描前 " + std::to_string(config_.max_processes_to_scan) + " 個");
         
-        for (DWORD i = 0; i < num_processes && i < config_.max_processes_to_scan; i++) {
-            if (processes[i] != 0) {
-                std::string process_name = get_process_name(processes[i]);
-                if (!process_name.empty()) {
-                    monitor_process(processes[i], process_name);
+//         for (DWORD i = 0; i < num_processes && i < config_.max_processes_to_scan; i++) {
+//             if (processes[i] != 0) {
+//                 std::string process_name = get_process_name(processes[i]);
+//                 if (!process_name.empty()) {
+//                     log_message("DEBUG", "[SCAN] 處理進程 " + std::to_string(i+1) + "/" + std::to_string(std::min<DWORD>(num_processes, config_.max_processes_to_scan)) + ": pid=" + std::to_string(processes[i]) + " name='" + process_name + "'");
+//                     monitor_process(processes[i], process_name);
+//                 } else {
+//                     log_message("DEBUG", "[SCAN] 跳過進程 pid=" + std::to_string(processes[i]) + " (無法獲取名稱)");
+//                 }
+//             }
+//         }
+//         log_message("DEBUG", "[SCAN] 進程掃描完成");
+//     } else {
+//         log_message("ERROR", "[SCAN] EnumProcesses 失敗: gle=" + std::to_string(GetLastError()));
+//     }
+// }
+
+// 新增：智能進程排序結構
+    struct PrioritizedProcess {
+        DWORD pid;
+        std::string name;
+        int priority;
+        
+        PrioritizedProcess(DWORD p, const std::string& n, int pri) 
+            : pid(p), name(n), priority(pri) {}
+        
+        bool operator<(const PrioritizedProcess& other) const {
+            return priority > other.priority; // 降序排列
+        }
+    };
+
+void MemoryMonitor::scan_processes() {
+        log_message("INFO", "開始掃描進程...");
+        
+        DWORD processes[4096];
+        DWORD cbNeeded;
+        
+        if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+            DWORD num_processes = cbNeeded / sizeof(DWORD);
+            const int max_processes_to_scan = 200;
+            
+            // 收集進程信息並排序
+            std::vector<PrioritizedProcess> process_list;
+            
+            for (DWORD i = 0; i < num_processes; i++) {
+                if (processes[i] != 0) {
+                    std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+                    if (!process_name.empty()) {
+                        int priority = MemoryMonitor::get_process_priority(processes[i], process_name);
+                        process_list.emplace_back(processes[i], process_name, priority);
+                    }
                 }
             }
+            
+            // 按優先級排序
+            std::sort(process_list.begin(), process_list.end());
+            
+            // 記錄前50個高優先級進程
+            log_message("INFO", "進程優先級排序（前50個）：");
+            for (size_t i = 0; i < std::min(process_list.size(), static_cast<size_t>(50)); i++) {
+                const auto& proc = process_list[i];
+                log_message("INFO", "PID: " + std::to_string(proc.pid) + 
+                           ", Name: " + proc.name + 
+                           ", Priority: " + std::to_string(proc.priority));
+            }
+            
+            // 優先掃描高優先級進程
+            int scanned_count = 0;
+            for (const auto& proc : process_list) {
+                if (scanned_count >= max_processes_to_scan) break;
+                
+                if (proc.priority > 0) { // 只掃描有優先級的進程
+                    if (scanned_count % 20 == 0) {
+                    log_message("INFO", "掃描高優先級進程: " + proc.name + 
+                               " (PID: " + std::to_string(proc.pid) + 
+                               ", Priority: " + std::to_string(proc.priority) + ")");
+                    }
+                    if (proc.name.find("attack_simulator") != std::string::npos ||
+                        proc.name.find("attack") != std::string::npos) {
+                        if (deep_scan_callback_) {
+                            log_message("DEBUG", "[DEEP-SCAN] 調用回調函數掃描攻擊模擬器: " + proc.name + " (PID: " + std::to_string(proc.pid) + ")");
+                            deep_scan_callback_(proc.pid);
+                        } else {
+                            log_message("WARN", "[DEEP-SCAN] 深度掃描回調未設置，跳過攻擊模擬器: " + proc.name + " (PID: " + std::to_string(proc.pid) + ")");
+                        }
+                    } else {
+                        monitor_process(proc.pid, proc.name);
+                    }
+                    scanned_count++;
+                }
+            }
+            
+            log_message("INFO", "完成進程掃描，共掃描 " + std::to_string(scanned_count) + " 個進程");
         }
     }
-}
+
 
 // 監控單個進程
 void MemoryMonitor::monitor_process(DWORD process_id, const std::string& process_name) {
+    // 詳細日誌：記錄傳遞給 add_process 的 PID 和名稱匹配結果
+    log_message("DEBUG", "[MONADD] 開始處理進程: pid=" + std::to_string(process_id) + " name='" + process_name + "'");
+    
     MemoryDetectionEngine::ProcessCategory category = classify_process(process_name);
+    log_message("DEBUG", "[MONADD] 進程分類結果: pid=" + std::to_string(process_id) + " category=" + std::to_string((int)category));
+    
+    // 嘗試打開進程句柄
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
+    if (!hProcess) {
+        log_message("DEBUG", "[MONADD] pid=" + std::to_string(process_id) + " OpenProcess fail gle=" + std::to_string(GetLastError()));
+        return;
+    }
+    
+    log_message("DEBUG", "[MONADD] pid=" + std::to_string(process_id) + " handle=0x" + EventUtils::format_address((uint64_t)hProcess) + " 成功添加到監控列表");
     
     {
         std::lock_guard<std::mutex> lock(processes_mutex_);
         ProcessInfo& info = monitored_processes_[process_id];
         info.process_id = process_id;
         info.process_name = process_name;
+        info.process_handle = hProcess;  // 設置進程句柄
         info.category = category;
         info.priority = get_process_priority(process_id, process_name);
         info.last_scan = std::chrono::steady_clock::now();
@@ -430,72 +541,72 @@ void MemoryMonitor::check_shared_memory() {
 
 bool MemoryMonitor::detect_modern_shellcode(const uint8_t* buffer, size_t size) {
     // 檢測Egg Hunter模式
-    const char egg_pattern[] = {0x66,0x81,0xCA,0xFF,0x0F,0x42,0x52,0x6A,0x02}; // NTAccessCheck
-    if (MemoryMonitor::find_pattern(buffer, size, egg_pattern, sizeof(egg_pattern))) return true;
+    constexpr unsigned char egg_pattern[] = {0x66,0x81,0xCA,0xFF,0x0F,0x42,0x52,0x6A,0x02}; // NTAccessCheck
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(egg_pattern), sizeof(egg_pattern))) return true;
 
     // 檢測反射式DLL注入特徵
-    const char reflective[] = {0xE8,0x00,0x00,0x00,0x00,0x5B,0x81,0xEB};
-    if (MemoryMonitor::find_pattern(buffer, size, reflective, sizeof(reflective))) return true;
+    constexpr unsigned char reflective[] = {0xE8,0x00,0x00,0x00,0x00,0x5B,0x81,0xEB};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(reflective), sizeof(reflective))) return true;
 
     // 檢測Cobalt Strike信標特徵
-    const char cobalt[] = {0x48,0x83,0xEC,0x28,0xB9,0x08,0x00,0x00,0x00};
-    if (MemoryMonitor::find_pattern(buffer, size, cobalt, sizeof(cobalt))) return true;
+    constexpr unsigned char cobalt[] = {0x48,0x83,0xEC,0x28,0xB9,0x08,0x00,0x00,0x00};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(cobalt), sizeof(cobalt))) return true;
     
     // 檢測Metasploit特徵
-    const char metasploit[] = {0x68,0x61,0x6C,0x6C,0x00,0x68,0x6E,0x65,0x6C,0x33,0x32}; // "hall\0" + "nel32"
-    if (MemoryMonitor::find_pattern(buffer, size, metasploit, sizeof(metasploit))) return true;
+    constexpr unsigned char metasploit[] = {0x68,0x61,0x6C,0x6C,0x00,0x68,0x6E,0x65,0x6C,0x33,0x32}; // "hall\0" + "nel32"
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(metasploit), sizeof(metasploit))) return true;
     
     // 檢測PowerShell Empire特徵
-    const char empire[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10};
-    if (MemoryMonitor::find_pattern(buffer, size, empire, sizeof(empire))) return true;
+    constexpr unsigned char empire[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(empire), sizeof(empire))) return true;
     
     // 檢測Mimikatz特徵
-    const char mimikatz[] = {0x48,0x83,0xEC,0x20,0x48,0x8B,0x05};
-    if (MemoryMonitor::find_pattern(buffer, size, mimikatz, sizeof(mimikatz))) return true;
+    constexpr unsigned char mimikatz[] = {0x48,0x83,0xEC,0x20,0x48,0x8B,0x05};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(mimikatz), sizeof(mimikatz))) return true;
     
     // 檢測Process Hollowing特徵
-    const char hollow[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
-    if (MemoryMonitor::find_pattern(buffer, size, hollow, sizeof(hollow))) return true;
+    constexpr unsigned char hollow[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(hollow), sizeof(hollow))) return true;
     
     // 檢測API Hashing特徵
-    const char api_hash[] = {0x48,0x31,0xC9,0x48,0x81,0xE9}; // xor rcx, rcx; sub rcx
-    if (MemoryMonitor::find_pattern(buffer, size, api_hash, sizeof(api_hash))) return true;
+    constexpr unsigned char api_hash[] = {0x48,0x31,0xC9,0x48,0x81,0xE9}; // xor rcx, rcx; sub rcx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(api_hash), sizeof(api_hash))) return true;
     
     // 檢測反虛擬機特徵
-    const char anti_vm[] = {0x64,0xA1,0x18,0x00,0x00,0x00,0x8B,0x40,0x30}; // PEB BeingDebugged
-    if (MemoryMonitor::find_pattern(buffer, size, anti_vm, sizeof(anti_vm))) return true;
+    constexpr unsigned char anti_vm[] = {0x64,0xA1,0x18,0x00,0x00,0x00,0x8B,0x40,0x30}; // PEB BeingDebugged
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(anti_vm), sizeof(anti_vm))) return true;
     
     // 檢測動態API解析特徵
-    const char dynamic_api[] = {0x48,0x8B,0x05,0x00,0x00,0x00,0x00,0x48,0x85,0xC0}; // mov rax, [rip+0]; test rax, rax
-    if (MemoryMonitor::find_pattern(buffer, size, dynamic_api, sizeof(dynamic_api))) return true;
+    constexpr unsigned char dynamic_api[] = {0x48,0x8B,0x05,0x00,0x00,0x00,0x00,0x48,0x85,0xC0}; // mov rax, [rip+0]; test rax, rax
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(dynamic_api), sizeof(dynamic_api))) return true;
     
     // 檢測Shellcode Loader特徵
-    const char loader[] = {0x48,0x89,0xE5,0x48,0x83,0xEC,0x20,0x48,0x89,0x5D,0xF8};
-    if (MemoryMonitor::find_pattern(buffer, size, loader, sizeof(loader))) return true;
+    constexpr unsigned char loader[] = {0x48,0x89,0xE5,0x48,0x83,0xEC,0x20,0x48,0x89,0x5D,0xF8};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(loader), sizeof(loader))) return true;
     
     // 檢測加密/解密特徵
-    const char crypto[] = {0x48,0x31,0xC0,0x48,0x31,0xC9,0x48,0x31,0xD2}; // xor rax, rax; xor rcx, rcx; xor rdx, rdx
-    if (MemoryMonitor::find_pattern(buffer, size, crypto, sizeof(crypto))) return true;
+    constexpr unsigned char crypto[] = {0x48,0x31,0xC0,0x48,0x31,0xC9,0x48,0x31,0xD2}; // xor rax, rax; xor rcx, rcx; xor rdx, rdx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(crypto), sizeof(crypto))) return true;
     
     // 檢測網絡通信特徵
-    const char network[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28};
-    if (MemoryMonitor::find_pattern(buffer, size, network, sizeof(network))) return true;
+    constexpr unsigned char network[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(network), sizeof(network))) return true;
     
     // 檢測文件操作特徵
-    const char file_ops[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D}; // lea rdx, [rip+0]; lea rcx
-    if (MemoryMonitor::find_pattern(buffer, size, file_ops, sizeof(file_ops))) return true;
+    constexpr unsigned char file_ops[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D}; // lea rdx, [rip+0]; lea rcx
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(file_ops), sizeof(file_ops))) return true;
     
     // 檢測註冊表操作特徵
-    const char registry[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D,0x00,0x00,0x00,0x00};
-    if (MemoryMonitor::find_pattern(buffer, size, registry, sizeof(registry))) return true;
+    constexpr unsigned char registry[] = {0x48,0x8D,0x15,0x00,0x00,0x00,0x00,0x48,0x8D,0x0D,0x00,0x00,0x00,0x00};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(registry), sizeof(registry))) return true;
     
     // 檢測進程注入特徵
-    const char injection[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
-    if (MemoryMonitor::find_pattern(buffer, size, injection, sizeof(injection))) return true;
+    constexpr unsigned char injection[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(injection), sizeof(injection))) return true;
     
     // 檢測權限提升特徵
-    const char priv_esc[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28,0x48,0x89,0x74,0x24,0x30};
-    if (MemoryMonitor::find_pattern(buffer, size, priv_esc, sizeof(priv_esc))) return true;
+    constexpr unsigned char priv_esc[] = {0x48,0x83,0xEC,0x28,0x48,0x89,0x5C,0x24,0x20,0x48,0x89,0x6C,0x24,0x28,0x48,0x89,0x74,0x24,0x30};
+    if (MemoryMonitor::find_pattern(buffer, size, reinterpret_cast<const char*>(priv_esc), sizeof(priv_esc))) return true;
     
     return false;
 }
@@ -686,7 +797,16 @@ std::vector<ExtendedProcessInfo> MemoryMonitor::get_monitored_processes() const 
     std::lock_guard<std::mutex> lock(processes_mutex_);
     std::vector<ExtendedProcessInfo> result;
     for (const auto& [pid, info] : monitored_processes_) {
-        result.push_back(info);
+        ExtendedProcessInfo ext_info;
+        ext_info.process_id = info.process_id;
+        ext_info.process_name = info.process_name;
+        ext_info.process_handle = info.process_handle;
+        ext_info.category = info.category;
+        ext_info.priority = info.priority;
+        ext_info.last_scan = info.last_scan;
+        ext_info.scan_count = info.scan_count;
+        ext_info.memory_regions = info.memory_regions;
+        result.push_back(ext_info);
     }
     return result;
 }
@@ -930,6 +1050,23 @@ bool MemoryMonitor::check_use_after_free_patterns(LPVOID address, SIZE_T size) {
 
 bool MemoryMonitor::check_buffer_overflow_patterns(LPVOID address, SIZE_T size) {
     return false;
+}
+
+// 實現 deep_scan_process 函數，使用 event_handler.cpp 中的檢測函數
+void MemoryMonitor::deep_scan_process(DWORD process_id) {
+    log_message("DEBUG", "[DEEP-SCAN] 開始深度掃描進程: pid=" + std::to_string(process_id));
+    
+    // 調用 scan_process_memory 進行基本掃描
+    scan_process_memory(process_id, false);
+    
+    // 記錄深度掃描完成
+    log_message("DEBUG", "[DEEP-SCAN] 完成深度掃描進程: pid=" + std::to_string(process_id));
+}
+
+
+// 輔助函數：檢查是否為可執行保護
+static inline bool is_executable_protect(DWORD p) {
+    return (p & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
 } // namespace RealMemoryDetection

@@ -5,10 +5,14 @@ add_library(memory_detection_engine STATIC
     memory_detection_utils.cpp
     memory_detection_veh.cpp
     detection_engine.cpp
+    event_handler.cpp
+    event_utils.cpp
+    event_normalizer.cpp
     memory_monitor.cpp
     logger.cpp
     performance_monitor.cpp
     process_lists.cpp
+    crash_handler.cpp
 )
 
 # 設定目標屬性
@@ -95,6 +99,38 @@ if(WIN32)
     )
 endif()
 
+# 創建崩潰測試程式
+add_executable(crash_test
+    crash_test.cpp
+)
+
+# 設定崩潰測試程式屬性
+set_target_properties(crash_test PROPERTIES
+    OUTPUT_NAME "crash_test"
+)
+
+# 包含目錄
+target_include_directories(crash_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(crash_test
+    memory_detection_engine
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(crash_test
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
 # 創建記憶體監控器可執行檔
 add_executable(memory_monitor
     memory_monitor_main.cpp
@@ -129,4 +165,41 @@ if(WIN32)
         advapi32
         shell32
     )
-endif() 
+endif()
+
+# ===== 測試配置 =====
+
+# 創建測試可執行文件
+add_executable(test_detection_id
+    test_detection_id.cpp
+)
+
+# 設定測試可執行文件屬性
+set_target_properties(test_detection_id PROPERTIES
+    OUTPUT_NAME "test_detection_id"
+)
+
+# 包含目錄
+target_include_directories(test_detection_id PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# 鏈接靜態庫
+target_link_libraries(test_detection_id
+    memory_detection_engine
+)
+
+# 鏈接Windows API庫
+if(WIN32)
+    target_link_libraries(test_detection_id
+        kernel32
+        user32
+        psapi
+        dbghelp
+        advapi32
+        shell32
+    )
+endif()
+
+# 添加測試
+add_test(NAME test_detection_id COMMAND test_detection_id) 

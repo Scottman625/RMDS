@@ -28,7 +28,7 @@ start "" /B cmd.exe %CLI%
 :: 第三階段：啟動檢測引擎
 echo.
 echo Starting universal detection engine...
-cd /d "%~dp0build\src\Release"
+cd /d "%~dp0build\src"
 
 :: 使用記憶體映射載入技術
 start "" /B real_detection_engine.exe /stealth /antidetect /entropy=7.2

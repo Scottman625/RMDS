@@ -7,6 +7,18 @@
 #include <chrono>
 #include "utils/process_lists.hpp"
 
+// Magic Header 保護機制
+struct MagicHeader {
+    uint32_t magic = 0x13572468;
+    bool is_valid() const { return magic == 0x13572468; }
+    void invalidate() { magic = 0; }
+};
+
+// 驗證 Magic Header 的輔助函數
+inline bool valid_magic(const MagicHeader* p) {
+    return p && p->is_valid();
+}
+
 namespace RealMemoryDetection {
 
 /**

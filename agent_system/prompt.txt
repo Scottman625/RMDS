@@ -1,0 +1,123 @@
+以下說明聚焦：為什麼你執行的 Scattered ROP 攻擊（選 5）沒有被偵測到；從日誌證據推導問題根因；指出關鍵缺口；給立即驗證步驟與修正建議。
+
+一、最核心原因（TL;DR）
+你的偵測流程根本沒有掃描到真正執行攻擊的那個進程；因此後續 detect_scattered_rop_chains() 也未被呼叫，當然不會產生告警。
+
+這不是「掃描失靈」的問題，而是「沒有對正確 PID 做掃描 / 未納管」的問題。
+
+二、直接證據對照
+攻擊端輸出顯示（你的模擬器互動畫面一開始）：
+Process name: attack_simulator.exe
+
+Process ID: 20408   (← 模擬器進程 PID)
+
+攻擊行為（16:16:58 ~ 16:16:59）建立 5 個 RX 記憶體區塊：
+例：VirtualProtect EXEC OK block=0x00000266F5FA0000
+
+... 直到 seg#5 base=0x00000266F5FE0000
+
+這些地址（0x00000266F5F...）都是該進程的私有配置。
+
+偵測端真正進行掃描時（第一輪 16:17:04、第二輪 16:17:14）顯示：
+*** SCAN_PROCESS_MEMORY pid=23852 ...
+
+後面列出大量 [REG] pid=23852 idx=...
+
+也就是說：你的掃描器在掃 pid=23852，而不是 pid=20408。
+
+而且這兩輪掃描結尾各自出現：
+*** SCAN_PROCESS_MEMORY pid=23852 regions=116 exec_private=0 ***
+
+*** SCAN_PROCESS_MEMORY pid=23852 regions=115 exec_private=0 ***
+
+表示在它掃描的那個進程（23852）裡找不到任何「同時為 MEM_PRIVATE 且可執行」的區域（exec_private=0），自然就不會進入後續的 gadget 檢測與分佈分析。
+
+你的攻擊建立的那 5 個 RX 區塊地址（0x00000266F5FA0000 ~ 0x00000266F5FE0000）在掃描列出的記憶體範圍中完全不存在（掃描列出的 base 主要是 0x00000004ca..., 0x0000017e..., 0x00007ff4..., 0x00007ffb... 等）。 → 再次確認不是同一個進程。
+
+日誌中完全沒有出現你原始 detect_scattered_rop_chains() 內寫的：
+"*** SCATTERED ROP SCAN: Process=..." 或 "*** GADGET SCAN COMPLETE..."
+
+→ 函式根本沒被呼叫。
+
+三、為什麼攻擊進程沒被掃描的常見技術性原因 （你可逐一交叉驗證）
+監控名單未加入：你的「monitored count=200」已滿或未對 20408 呼叫 AddMonitor / OpenProcess 成功。
+白名單 / 篩選：可能有一段邏輯排除了某些映像名稱（如 attack_simulator.exe）或是未達到某類觸發條件。
+權限問題：掃描器若以較低權限執行，對某些進程 OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ) 失敗，程式未記錄 error（建議加失敗輸出）。
+PID 生命周期競態：模擬器啟動與你的監控輪詢插入之間錯過了註冊事件（未 hook CreateProcess / 沒有即時插入）。
+分類(cat=0)邏輯 gating：你日誌裡 [MONLIST] 列出的 PID 都有 cat=0，顯示分類框架存在，但可能對 20408 根本沒列出。
+進程 PID 對映錯誤：若你在多會話(Session)或使用 WOW64 / 不同位元模式，可能有一層代理進程；你抓到的是另一個「控制 / 啟動器」而非真正攻擊實體進程。
+監控啟動順序：若掃描器啟動前模擬器已存在且你只監控“新建立進程”，可能需一次性全量掃描來補登（ALL_PROCESSES_SCAN 要確認是否有實際將 20408 重新納入）。
+四、為什麼 exec_private=0 特別值得重視
+你的偵測邏輯（依你之前程式碼）應該將 MEM_COMMIT 並且 Protect 含 PAGE_EXECUTE* 的 MEM_PRIVATE 區域統計。
+
+若真掃到攻擊進程：
+
+5 個區域每個尺寸 2048~4096 (<8192)，保護 PAGE_EXECUTE_READ (0x20) → 至少 exec_private 應為 5。
+現在 =0 → 不是“被誤判為非 EXEC”，而是“那 5 個區域壓根不在被掃描的進程地址空間”。
+五、次要技術限制（即使掃到也可能影響偵測強度） （根因仍是沒掃到，但這些要列給你後續補強）
+沒有時間關聯：5 個段在 1 秒內出現，你目前沒做“速率”特徵。
+只看 0xC3（你的 gadget 偵測邏輯過於簡化）。
+未強制對 VirtualProtect 事件即時掃描（依賴週期 10 秒 → 會有延遲窗口）。
+沒有 cross-check MEM_PRIVATE + EXEC 突然增量的 heuristics。
+六、立即驗證步驟（建議你先做）
+A. 在攻擊程式內加：GetCurrentProcessId() 印出 PID → 確認就是 20408。
+
+B. 在偵測端加 debug：列出被監控 PID 清單，確認是否包含 20408。
+
+C. 手動對 20408 執行一次 VirtualQueryEx 全列，grep 0x266F5FA0000 等地址 → 若能看到且 Protect=0x20, Type=MEM_PRIVATE → 證實攻擊區塊存在。
+
+D. 在 VirtualAlloc / VirtualProtect hook（或調用封裝）裡發送“立即掃描”事件，看看是否仍不進入 detect_scattered_rop_chains。
+
+E. 增加失敗路徑 log：OpenProcess 失敗時輸出 GetLastError。
+
+七、你應該新增的偵測端 Debug Log
+Process enrollment: [MONITOR] add pid=XXXX result=OK/FAIL last_error=...
+OpenProcess 每次失敗：
+[PROCOPEN] pid=XXXX access=... fail gle=...
+Gating 條件詳述：
+[SCAN-SKIP] pid=XXXX reason=NOT_ENROLLED
+[SCAN-SKIP] pid=XXXX reason=NO_EXEC_PRIVATE
+在記憶體掃描開始前列出：
+[SCAN-START] pid=XXXX interval=... last_scan_age=...
+detect_scattered_rop_chains 入口：
+[SCATTER] start pid=XXXX exec_regions=X
+exec_private 計算來源細節：
+[SCATTER] region base=... size=... protect=... state=... type=... included=Y/N reason=...
+八、修正優先順序（Roadmap 精簡版）
+先解決“監控不到攻擊進程”：
+Hook CreateProcess / EnumProcesses 定期全量補差異。
+提高或取消 200 個 monitored 上限，或做 LRU/優先權機制。
+確認位元數與存取權限 (PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)。
+增加 VirtualProtect 即時觸發掃描 / 或記錄 RW→RX 事件佇列。
+加入 exec_private 計數 gating 前的詳盡 log。
+成功後再擴展 gadget heuristics（ret variants / pivot / density）。
+九、快速自我檢查清單
+ 我能列出攻擊時刻偵測器的“已監控 PID 清單”，且包含 20408
+ 對 20408 手動 VirtualQueryEx 能看到那 5 個 RX 區域
+ 偵測程式的掃描 log 有出現 SCATTER / GADGET SCAN debug
+ exec_private > 0
+ detect_scattered_rop_chains 被呼叫後有顯示找到的 gadget 數
+若上述任一為否，先處理，再談 heuristics 調優。
+十、加碼：若你其實是多進程架構
+若 attack_simulator.exe 內部再 Spawn 一個子進程執行 payload（PID 不同），你手動看到的 20408 只是啟動器；需檢查是否出現一個新 PID（可能就是 23852 或別的）真正承載攻擊。
+
+但此案例中 23852 沒有那些地址，也沒有 MEM_PRIVATE+EXEC → 幾乎可以排除。仍是 enrollment 問題可能性最高。
+
+十一、最小驗證程式碼片段（僅示意）
+(偵測端) 列出 enrollment
+for (auto& p : monitored_table) {
+log("MON-STATE pid=%u enrolled_at=%llu last_scan=%llu", p.pid, p.ts_add, p.ts_last_scan);
+}
+
+在加入監控處：
+if(!OpenProcess(...)) {
+log("PROCOPEN fail pid=%u gle=%lu", pid, GetLastError());
+}
+
+十二、結論
+攻擊未被偵測，不是因為 gadget 太隱蔽，而是因為：
+
+攻擊進程未被納入掃描對象或掃描時機錯過。
+偵測模組因此沒有看到任何 MEM_PRIVATE + EXEC 區域（exec_private=0），故未進入 ROP 分析函數。
+日誌缺乏關鍵“函數入口 / 區域篩選”細節，造成你難以第一時間定位。
+先修 Enrollment 與觸發鏈，再談 gadget 分析進階化。

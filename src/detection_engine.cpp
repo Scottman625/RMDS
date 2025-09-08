@@ -1,4 +1,16 @@
 #include <iostream>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <unordered_set>
+#include <unordered_map>
+#include <string>
+#include <vector>
+#include <memory>
+#include <algorithm>
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -6,6 +18,7 @@
 #include <DbgHelp.h>
 #include <Psapi.h>
 #include <TlHelp32.h>
+
 #include <thread>
 #include <vector>
 #include <atomic>
@@ -30,9 +43,12 @@
 #include "../include/utils/performance_monitor.hpp"
 #include "../include/utils/logger.hpp"
 #include "../include/utils/process_lists.hpp"
+#include "../include/event_handler.hpp"
 
+#ifdef _MSC_VER
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
+#endif
 
 // 添加缺少的常數定義
 #ifndef EXCEPTION_GUARD_PAGE_VIOLATION
@@ -153,14 +169,28 @@ bool should_report_heap_issue(DWORD pid, uint64_t base) {
     return true;
 }
 
+void RealMemoryDetectionEngine::log_message(const std::string& level, const std::string& message) {
+    // 優先使用 logger_，沒有時退回到 stderr
+    if (logger_) {
+        try {
+            logger_->log(level, message);
+        } catch (...) {
+            std::cerr << "[" << level << "] " << message << std::endl;
+        }
+    } else {
+        std::cerr << "[" << level << "] " << message << std::endl;
+    }
+}
+
 /**
  * 真正的記憶體攻擊檢測引擎實現
  * 使用底層 Windows API 實現真實的記憶體監控和攻擊檢測
  */
-class DetectionEngineImpl : public RealMemoryDetectionEngine, public MemoryMonitor {
+class DetectionEngine : public RealMemoryDetectionEngine, public MemoryMonitor {
 private:
-    // 添加 monitor 成員
-    std::unique_ptr<MemoryMonitor> memory_monitor_;
+    
+    // 添加 EventHandler 成員
+    std::unique_ptr<EventHandler> event_handler_;
     
     // 移除重複的數據結構（這些現在在 monitor 中）
     // 移除：ProcessCategory, ProcessInfo, MemoryRegion, AdaptiveThresholds
@@ -692,7 +722,7 @@ private:
         }
     
         // 非線性熵值影響
-        double entropy_factor = std::clamp((entropy - 5.0) * 0.8, 0.0, 3.0);
+        double entropy_factor = std::max(0.0, std::min(3.0, (entropy - 5.0) * 0.8));
         int adjusted = base_threshold + static_cast<int>(entropy_factor * 5) + process_boost;
     
         // 基於時間的動態調整
@@ -702,14 +732,14 @@ private:
         
         if (now - last_updated > 60s) {
             // 每分鐘衰減閾值調整
-            for (auto& [key, val] : process_thresholds) {
-                val = val * 0.9;
+            for (auto& pair : process_thresholds) {
+                pair.second = pair.second * 0.9;
             }
             last_updated = now;
         }
         adjusted += process_thresholds[process_name];
         
-        return std::clamp(adjusted, 25, 75);
+        return std::max(25, std::min(75, adjusted));
     }
 
     // 新增輔助函數
@@ -993,368 +1023,346 @@ private:
         return false;
     }
 
-    void detection_loop() {
-        while (running_) {
-            try {
-                // 使用 monitor 進行底層掃描
-                if (memory_monitor_) {
-                    memory_monitor_->scan_processes();
-                    memory_monitor_->scan_memory_regions();
-                }
+    // void detection_loop() {
+    //     while (running_) {
+    //         try {
+    //             // 使用 monitor 進行底層掃描 - 這些仍然需要定期執行
+    //             if (memory_monitor_) {
+    //                 memory_monitor_->scan_processes();
+    //                 memory_monitor_->scan_memory_regions();
+    //             }
                 
-                // 執行高層檢測邏輯 - 使用 monitor 的進程信息
-                if (memory_monitor_) {
-                    auto processes = memory_monitor_->get_monitored_processes();
-                    for (const auto& process : processes) {
-                        if (process.process_handle != INVALID_HANDLE_VALUE) {
-                            // 直接使用 process.category，因為它已經是 ProcessCategory 類型
-                            perform_comprehensive_attack_detection(process.process_id, process.process_handle, process.category);   
-                        }
-                    }
-                }
+    //             // 所有其他檢測邏輯現在由 EventHandler 的事件系統處理
+    //             // 包括：
+    //             // - 綜合攻擊檢測
+    //             // - 記憶體掃描
+    //             // - 全進程掃描
+    //             // - 狀態輸出
+    //             // - 循環完成處理
                 
-                // 降低掃描頻率 - 每5秒掃描一次
-                scan_memory_for_attacks();
-                std::this_thread::sleep_for(std::chrono::seconds(10));
+    //             // 簡化的主循環 - 只負責基本的監控和協調
+    //             std::this_thread::sleep_for(std::chrono::seconds(10));
                 
-                // 每10秒進行一次全進程掃描（原本是60秒）
-                if (cycle_output_counter_ % 3 == 0) {
-                    scan_all_processes_memory();
-                }
-                
-                // 每60秒輸出一次狀態 (每12次循環 = 12 * 5秒 = 60秒)
-                status_output_counter_++;
-                if (status_output_counter_ >= 5) { // 12 * 5s = 60s
-                    show_status();
-                    status_output_counter_ = 0;
-                }
-                
-                // 每300秒輸出一次循環信息 (每60次循環 = 60 * 5秒 = 300秒)
-                cycle_output_counter_++;
-                if (cycle_output_counter_ >= 10) { // 60 * 5s = 300s
-                    std::cout << "Detection cycle completed. Total detections: " << total_detections_.load() << std::endl;
-                    log_message("INFO", "Detection cycle completed. Total detections: " + std::to_string(total_detections_.load()));
-                    
-                    // 清理舊的攻擊模擬器輸出控制項
-                    cleanup_simulator_output_controls();
-                    
-                    cycle_output_counter_ = 0;
-                }
-            }
-            catch (const std::exception& e) {
-                std::cerr << "Detection loop exception: " << e.what() << std::endl;
-                log_message("ERROR", "Detection loop exception: " + std::string(e.what()));
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-            catch (...) {
-                std::cerr << "Unknown exception in detection loop" << std::endl;
-                log_message("ERROR", "Unknown exception in detection loop");
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-        }
-    }
+    //             // 定期檢查 EventHandler 狀態
+    //             if (event_handler_) {
+    //                 // EventHandler 內部已經處理了所有的定時任務
+    //                 // 這裡只需要確保 EventHandler 正常運行
+    //             }
+    //         }
+    //         catch (const std::exception& e) {
+    //             std::cerr << "Detection loop exception: " << e.what() << std::endl;
+    //             log_message("ERROR", "Detection loop exception: " + std::string(e.what()));
+    //             std::this_thread::sleep_for(std::chrono::seconds(1));
+    //         }
+    //         catch (...) {
+    //             std::cerr << "Unknown exception in detection loop" << std::endl;
+    //             log_message("ERROR", "Unknown exception in detection loop");
+    //             std::this_thread::sleep_for(std::chrono::seconds(1));
+    //         }
+    //     }
+    // }
 
-    void scan_memory_for_attacks() {
-        try {
-            std::cout << "  scan_memory_for_attacks: Starting..." << std::endl;
-            std::cerr << "  scan_memory_for_attacks: Starting... (stderr)" << std::endl;
+    // void scan_memory_for_attacks() {
+    //     try {
+    //         std::cout << "  scan_memory_for_attacks: Starting..." << std::endl;
+    //         std::cerr << "  scan_memory_for_attacks: Starting... (stderr)" << std::endl;
             
-            // 簡化的記憶體掃描實現 - 掃描所有區域但限制數量
-            MEMORY_BASIC_INFORMATION mbi;
-            LPVOID address = 0;
-            int scanned_regions = 0;
-            const int max_regions_to_scan = 10; // 恢復到10個區域
+    //         // 簡化的記憶體掃描實現 - 掃描所有區域但限制數量
+    //         MEMORY_BASIC_INFORMATION mbi;
+    //         LPVOID address = 0;
+    //         int scanned_regions = 0;
+    //         const int max_regions_to_scan = 10; // 恢復到10個區域
             
-            while (VirtualQuery(address, &mbi, sizeof(mbi)) && scanned_regions < max_regions_to_scan) {
-                try {
-                    std::cout << "    Scanning region " << scanned_regions + 1 << " at " << address << std::endl;
+    //         while (VirtualQuery(address, &mbi, sizeof(mbi)) && scanned_regions < max_regions_to_scan) {
+    //             try {
+    //                 std::cout << "    Scanning region " << scanned_regions + 1 << " at " << address << std::endl;
                     
-                    // 檢查所有已提交的記憶體區域
-                    if (mbi.State == MEM_COMMIT) {
-                        // 檢查可執行記憶體
-                        if (mbi.Protect & PAGE_EXECUTE) {
-                            try {
-                                check_executable_integrity(mbi.BaseAddress, mbi.RegionSize);
-                            }
-                            catch (const std::exception& e) {
-                                std::cerr << "    Error checking executable integrity: " << e.what() << std::endl;
-                            }
-                            catch (...) {
-                                std::cerr << "    Unknown error checking executable integrity" << std::endl;
-                            }
-                        }
+    //                 // 檢查所有已提交的記憶體區域
+    //                 if (mbi.State == MEM_COMMIT) {
+    //                     // 檢查可執行記憶體
+    //                     if (mbi.Protect & PAGE_EXECUTE) {
+    //                         try {
+    //                             check_executable_integrity(mbi.BaseAddress, mbi.RegionSize);
+    //                         }
+    //                         catch (const std::exception& e) {
+    //                             std::cerr << "    Error checking executable integrity: " << e.what() << std::endl;
+    //                         }
+    //                         catch (...) {
+    //                             std::cerr << "    Unknown error checking executable integrity" << std::endl;
+    //                         }
+    //                     }
                         
-                        // 檢查堆區域 - 擴展檢查條件，包括所有可讀寫的記憶體
-                        if (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED || 
-                            (mbi.Protect & PAGE_READWRITE) || (mbi.Protect & PAGE_READONLY) ||
-                            (mbi.Protect & PAGE_EXECUTE_READWRITE)) {
-                            try {
-                                // 移除詳細的堆積區域掃描日誌，減少日誌輸出
-                                check_heap_region(mbi.BaseAddress, mbi.RegionSize);
-                            }
-                            catch (const std::exception& e) {
-                                std::cerr << "    Error checking heap region: " << e.what() << std::endl;
-                            }
-                            catch (...) {
-                                std::cerr << "    Unknown error checking heap region" << std::endl;
-                            }
-                        }
+    //                     // 檢查堆區域 - 擴展檢查條件，包括所有可讀寫的記憶體
+    //                     if (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED || 
+    //                         (mbi.Protect & PAGE_READWRITE) || (mbi.Protect & PAGE_READONLY) ||
+    //                         (mbi.Protect & PAGE_EXECUTE_READWRITE)) {
+    //                         try {
+    //                             // 移除詳細的堆積區域掃描日誌，減少日誌輸出
+    //                             check_heap_region(mbi.BaseAddress, mbi.RegionSize);
+    //                         }
+    //                         catch (const std::exception& e) {
+    //                             std::cerr << "    Error checking heap region: " << e.what() << std::endl;
+    //                         }
+    //                         catch (...) {
+    //                             std::cerr << "    Unknown error checking heap region" << std::endl;
+    //                         }
+    //                     }
                         
-                        // 額外檢查：掃描攻擊模擬器進程的記憶體
-                        static std::vector<DWORD> scanned_processes;
-                        DWORD current_pid = GetCurrentProcessId();
+    //                     // 額外檢查：掃描攻擊模擬器進程的記憶體
+    //                     static std::vector<DWORD> scanned_processes;
+    //                     DWORD current_pid = GetCurrentProcessId();
                         
-                        // 動態檢測攻擊模擬器進程
-                        DWORD processes[1024];
-                        DWORD cbNeeded;
-                        if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
-                            DWORD num_processes = cbNeeded / sizeof(DWORD);
-                            for (DWORD i = 0; i < num_processes; i++) {
-                                if (processes[i] != 0) {
-                                    std::string process_name = MemoryMonitor::get_process_name(processes[i]);
-                                    if (process_name.find("attack_simulator") != std::string::npos) {
-                                        // 檢查是否已經掃描過這個進程
-                                        bool already_scanned = false;
-                                        for (const auto& scanned : scanned_processes) {
-                                            if (scanned == processes[i]) {
-                                                already_scanned = true;
-                                                break;
-                                            }
-                                        }
+    //                     // 動態檢測攻擊模擬器進程
+    //                     DWORD processes[1024];
+    //                     DWORD cbNeeded;
+    //                     if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+    //                         DWORD num_processes = cbNeeded / sizeof(DWORD);
+    //                         for (DWORD i = 0; i < num_processes; i++) {
+    //                             if (processes[i] != 0) {
+    //                                 std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+    //                                 if (process_name.find("attack_simulator") != std::string::npos) {
+    //                                     // 檢查是否已經掃描過這個進程
+    //                                     bool already_scanned = false;
+    //                                     for (const auto& scanned : scanned_processes) {
+    //                                         if (scanned == processes[i]) {
+    //                                             already_scanned = true;
+    //                                             break;
+    //                                         }
+    //                                     }
                                         
-                                        if (!already_scanned) {
-                                            scanned_processes.push_back(processes[i]);
-                                            log_message("DEBUG", "*** FOUND ATTACK SIMULATOR: PID=" + std::to_string(processes[i]) + " ***");
-                                        }
-                                    }
-                                }
-                            }
-                        }
+    //                                     if (!already_scanned) {
+    //                                         scanned_processes.push_back(processes[i]);
+    //                                         log_message("DEBUG", "*** FOUND ATTACK SIMULATOR: PID=" + std::to_string(processes[i]) + " ***");
+    //                                     }
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
                         
-                        // 檢查是否有攻擊模擬器進程需要掃描
-                        for (const auto& process : scanned_processes) {
-                            if (process != current_pid) {
-                                try {
-                                    HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, process);
-                                    if (hProcess) {
-                                        log_message("DEBUG", "*** SCANNING ATTACK SIMULATOR PROCESS: PID=" + std::to_string(process) + " ***");
-                                        scan_process_heap_regions(hProcess, process);
-                                        CloseHandle(hProcess);
-                                    }
-                                }
-                                catch (...) {
-                                    // 忽略進程訪問錯誤
-                                }
-                            }
-                        }
+    //                     // 檢查是否有攻擊模擬器進程需要掃描
+    //                     for (const auto& process : scanned_processes) {
+    //                         if (process != current_pid) {
+    //                             try {
+    //                                 HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, process);
+    //                                 if (hProcess) {
+    //                                     log_message("DEBUG", "*** SCANNING ATTACK SIMULATOR PROCESS: PID=" + std::to_string(process) + " ***");
+    //                                     scan_process_heap_regions(hProcess, process);
+    //                                     CloseHandle(hProcess);
+    //                                 }
+    //                             }
+    //                             catch (...) {
+    //                                 // 忽略進程訪問錯誤
+    //                             }
+    //                         }
+    //                     }
                         
-                        scanned_regions++;
-                        std::cout << "    Completed region " << scanned_regions << std::endl;
-                    }
+    //                     scanned_regions++;
+    //                     std::cout << "    Completed region " << scanned_regions << std::endl;
+    //                 }
                     
-                    // 安全地計算下一個地址
-                    try {
-                        address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
-                    }
-                    catch (...) {
-                        std::cerr << "    Error calculating next address" << std::endl;
-                        break;
-                    }
-                }
-                catch (const std::exception& e) {
-                    std::cerr << "    Error scanning memory region: " << e.what() << std::endl;
-                    try {
-                        address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
-                    }
-                    catch (...) {
-                        std::cerr << "    Error calculating next address after exception" << std::endl;
-                        break;
-                    }
-                }
-                catch (...) {
-                    std::cerr << "    Unknown error scanning memory region" << std::endl;
-                    try {
-                        address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
-                    }
-                    catch (...) {
-                        std::cerr << "    Error calculating next address after unknown exception" << std::endl;
-                        break;
-                    }
-                }
-            }
+    //                 // 安全地計算下一個地址
+    //                 try {
+    //                     address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
+    //                 }
+    //                 catch (...) {
+    //                     std::cerr << "    Error calculating next address" << std::endl;
+    //                     break;
+    //                 }
+    //             }
+    //             catch (const std::exception& e) {
+    //                 std::cerr << "    Error scanning memory region: " << e.what() << std::endl;
+    //                 try {
+    //                     address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
+    //                 }
+    //                 catch (...) {
+    //                     std::cerr << "    Error calculating next address after exception" << std::endl;
+    //                     break;
+    //                 }
+    //             }
+    //             catch (...) {
+    //                 std::cerr << "    Unknown error scanning memory region" << std::endl;
+    //                 try {
+    //                     address = (LPVOID)((uint64_t)mbi.BaseAddress + mbi.RegionSize);
+    //                 }
+    //                 catch (...) {
+    //                     std::cerr << "    Error calculating next address after unknown exception" << std::endl;
+    //                     break;
+    //                 }
+    //             }
+    //         }
             
-            std::cout << "  scan_memory_for_attacks: Completed, scanned " << scanned_regions << " regions" << std::endl;
-            std::cerr << "  scan_memory_for_attacks: Completed, scanned " << scanned_regions << " regions (stderr)" << std::endl;
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error in scan_memory_for_attacks: " << e.what() << std::endl;
-        }
-        catch (...) {
-            std::cerr << "Unknown error in scan_memory_for_attacks" << std::endl;
-        }
-    }
+    //         std::cout << "  scan_memory_for_attacks: Completed, scanned " << scanned_regions << " regions" << std::endl;
+    //         std::cerr << "  scan_memory_for_attacks: Completed, scanned " << scanned_regions << " regions (stderr)" << std::endl;
+    //     }
+    //     catch (const std::exception& e) {
+    //         std::cerr << "Error in scan_memory_for_attacks: " << e.what() << std::endl;
+    //     }
+    //     catch (...) {
+    //         std::cerr << "Unknown error in scan_memory_for_attacks" << std::endl;
+    //     }
+    // }
 
-    void scan_all_processes_memory() {
-        try {
-            DWORD processes[1024];
-            DWORD cbNeeded;
+    // void scan_all_processes_memory() {
+    //     try {
+    //         DWORD processes[1024];
+    //         DWORD cbNeeded;
             
-            if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
-                DWORD num_processes = cbNeeded / sizeof(DWORD);
-                const int max_processes_to_scan = 100; // 增加掃描進程數量
+    //         if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+    //             DWORD num_processes = cbNeeded / sizeof(DWORD);
+    //             const int max_processes_to_scan = 100; // 增加掃描進程數量
                 
-                int scanned_count = 0;
-                for (DWORD i = 0; i < num_processes && i < max_processes_to_scan; i++) {
-                    try {
-                        if (processes[i] != 0) {
-                            std::string process_name = MemoryMonitor::get_process_name(processes[i]);
-                            ProcessCategory category = classify_process(process_name);
+    //             int scanned_count = 0;
+    //             for (DWORD i = 0; i < num_processes && i < max_processes_to_scan; i++) {
+    //                 try {
+    //                     if (processes[i] != 0) {
+    //                         std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+    //                         ProcessCategory category = classify_process(process_name);
                             
-                            // 添加調試輸出 - 檢查所有進程名稱
-                            if (process_name.find("attack") != std::string::npos || 
-                                process_name.find("simulator") != std::string::npos) {
-                                std::cout << "  *** DEBUG: Found potential attack simulator: PID " << processes[i] 
-                                          << " (" << process_name << ") Category: " 
-                                          << (category == ProcessCategory::ATTACK_SIMULATOR ? "ATTACK_SIMULATOR" : 
-                                              category == ProcessCategory::HIGH_RISK_PROCESS ? "HIGH_RISK" :
-                                              category == ProcessCategory::SYSTEM_PROCESS ? "SYSTEM" : "USER") << " ***" << std::endl;
-                                log_message("DEBUG", "*** Found potential attack simulator: PID " + std::to_string(processes[i]) + 
-                                           " (" + process_name + ") Category: " + 
-                                           (category == ProcessCategory::ATTACK_SIMULATOR ? "ATTACK_SIMULATOR" : 
-                                            category == ProcessCategory::HIGH_RISK_PROCESS ? "HIGH_RISK" :
-                                            category == ProcessCategory::SYSTEM_PROCESS ? "SYSTEM" : "USER"));
-                            }
+    //                         // 添加調試輸出 - 檢查所有進程名稱
+    //                         if (process_name.find("attack") != std::string::npos || 
+    //                             process_name.find("simulator") != std::string::npos) {
+    //                             std::cout << "  *** DEBUG: Found potential attack simulator: PID " << processes[i] 
+    //                                       << " (" << process_name << ") Category: " 
+    //                                       << (category == ProcessCategory::ATTACK_SIMULATOR ? "ATTACK_SIMULATOR" : 
+    //                                           category == ProcessCategory::HIGH_RISK_PROCESS ? "HIGH_RISK" :
+    //                                           category == ProcessCategory::SYSTEM_PROCESS ? "SYSTEM" : "USER") << " ***" << std::endl;
+    //                             log_message("DEBUG", "*** Found potential attack simulator: PID " + std::to_string(processes[i]) + 
+    //                                        " (" + process_name + ") Category: " + 
+    //                                        (category == ProcessCategory::ATTACK_SIMULATOR ? "ATTACK_SIMULATOR" : 
+    //                                         category == ProcessCategory::HIGH_RISK_PROCESS ? "HIGH_RISK" :
+    //                                         category == ProcessCategory::SYSTEM_PROCESS ? "SYSTEM" : "USER"));
+    //                         }
                             
-                            // 檢查進程是否可訪問 - 嘗試多種權限組合
-                            HANDLE hProcess = NULL;
-                            DWORD last_error = 0;
+    //                         // 檢查進程是否可訪問 - 嘗試多種權限組合
+    //                         HANDLE hProcess = NULL;
+    //                         DWORD last_error = 0;
                             
-                            // 嘗試不同的權限組合
-                            const DWORD access_flags[] = {
-                                PROCESS_ALL_ACCESS, // 使用最高權限
-                                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                                PROCESS_QUERY_INFORMATION,
-                                PROCESS_QUERY_LIMITED_INFORMATION
-                            };
+    //                         // 嘗試不同的權限組合
+    //                         const DWORD access_flags[] = {
+    //                             PROCESS_ALL_ACCESS, // 使用最高權限
+    //                             PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+    //                             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+    //                             PROCESS_QUERY_INFORMATION,
+    //                             PROCESS_QUERY_LIMITED_INFORMATION
+    //                         };
                             
-                            for (int flag_idx = 0; flag_idx < 5 && !hProcess; flag_idx++) {
-                                hProcess = OpenProcess(access_flags[flag_idx], FALSE, processes[i]);
-                                if (!hProcess) {
-                                    last_error = GetLastError();
-                                }
-                            }
+    //                         for (int flag_idx = 0; flag_idx < 5 && !hProcess; flag_idx++) {
+    //                             hProcess = OpenProcess(access_flags[flag_idx], FALSE, processes[i]);
+    //                             if (!hProcess) {
+    //                                 last_error = GetLastError();
+    //                             }
+    //                         }
                             
-                            if (hProcess) {
-                                // 根據進程類別決定掃描策略
-                                switch (category) {
-                                    case ProcessCategory::ATTACK_SIMULATOR:
-                                        std::cout << "  *** FOUND ATTACK SIMULATOR: PID " << processes[i] << " ***" << std::endl;
-                                        std::cout << "  *** Process Name: " << process_name << " ***" << std::endl;
-                                        log_message("DEBUG", "*** FOUND ATTACK SIMULATOR: PID " + std::to_string(processes[i]) + " ***");
-                                        log_message("DEBUG", "*** Process Name: " + process_name + " ***");
-                                        // 立即進行深度掃描
-                                        deep_scan_process(processes[i]);
-                                        break;
+    //                         if (hProcess) {
+    //                             // 根據進程類別決定掃描策略
+    //                             switch (category) {
+    //                                 case ProcessCategory::ATTACK_SIMULATOR:
+    //                                     std::cout << "  *** FOUND ATTACK SIMULATOR: PID " << processes[i] << " ***" << std::endl;
+    //                                     std::cout << "  *** Process Name: " << process_name << " ***" << std::endl;
+    //                                     log_message("DEBUG", "*** FOUND ATTACK SIMULATOR: PID " + std::to_string(processes[i]) + " ***");
+    //                                     log_message("DEBUG", "*** Process Name: " + process_name + " ***");
+    //                                     // 立即進行深度掃描
+    //                                     deep_scan_process(processes[i]);
+    //                                     break;
                                         
-                                    case ProcessCategory::HIGH_RISK_PROCESS:
-                                        std::cout << "  *** HIGH RISK PROCESS: PID " << processes[i] << " (" << process_name << ") ***" << std::endl;
-                                        log_message("DEBUG", "*** HIGH RISK PROCESS: PID " + std::to_string(processes[i]) + " (" + process_name + ") ***");
-                                        // 對高風險進程進行深度掃描
-                                        deep_scan_process(processes[i]);
-                                        break;
+    //                                 case ProcessCategory::HIGH_RISK_PROCESS:
+    //                                     std::cout << "  *** HIGH RISK PROCESS: PID " << processes[i] << " (" << process_name << ") ***" << std::endl;
+    //                                     log_message("DEBUG", "*** HIGH RISK PROCESS: PID " + std::to_string(processes[i]) + " (" + process_name + ") ***");
+    //                                     // 對高風險進程進行深度掃描
+    //                                     deep_scan_process(processes[i]);
+    //                                     break;
                                         
-                                    case ProcessCategory::SYSTEM_PROCESS:
-                                        // 系統進程使用較高的閾值，減少誤報
-                                        if (scanned_count % 10 == 0) { // 每10個系統進程掃描一次
-                                            scan_process_memory(processes[i], true);
-                                        }
-                                        break;
+    //                                 case ProcessCategory::SYSTEM_PROCESS:
+    //                                     // 系統進程使用較高的閾值，減少誤報
+    //                                     if (scanned_count % 10 == 0) { // 每10個系統進程掃描一次
+    //                                         scan_process_memory(processes[i], true);
+    //                                     }
+    //                                     break;
                                         
-                                    case ProcessCategory::USER_PROCESS:
-                                        // 用戶進程使用中等閾值
-                                        if (scanned_count % 5 == 0) { // 每5個用戶進程掃描一次
-                                            scan_process_memory(processes[i], false);
-                                        }
-                                        break;
-                                }
+    //                                 case ProcessCategory::USER_PROCESS:
+    //                                     // 用戶進程使用中等閾值
+    //                                     if (scanned_count % 5 == 0) { // 每5個用戶進程掃描一次
+    //                                         scan_process_memory(processes[i], false);
+    //                                     }
+    //                                     break;
+    //                             }
                                 
-                                CloseHandle(hProcess);
-                            } else {
-                                // 只在調試模式下輸出錯誤信息
-                                if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
-                                    std::cout << "  *** Process " << processes[i] << " (" << process_name << ") is NOT accessible (Error: " << last_error << ") ***" << std::endl;
-                                    log_message("DEBUG", "*** Process " + std::to_string(processes[i]) + " (" + process_name + ") is NOT accessible (Error: " + std::to_string(last_error) + ") ***");
-                                }
-                            }
+    //                             CloseHandle(hProcess);
+    //                         } else {
+    //                             // 只在調試模式下輸出錯誤信息
+    //                             if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
+    //                                 std::cout << "  *** Process " << processes[i] << " (" << process_name << ") is NOT accessible (Error: " << last_error << ") ***" << std::endl;
+    //                                 log_message("DEBUG", "*** Process " + std::to_string(processes[i]) + " (" + process_name + ") is NOT accessible (Error: " + std::to_string(last_error) + ") ***");
+    //                             }
+    //                         }
                             
-                            scanned_count++;
-                        }
-                    }
-                    catch (const std::exception& e) {
-                        std::string process_name = MemoryMonitor::get_process_name(processes[i]);
-                        ProcessCategory category = classify_process(process_name);
-                        if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
-                            std::cerr << "  Error scanning process " << processes[i] << " (" << process_name << "): " << e.what() << std::endl;
-                        }
-                    }
-                    catch (...) {
-                        std::string process_name = MemoryMonitor::get_process_name(processes[i]);
-                        ProcessCategory category = classify_process(process_name);
-                        if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
-                            std::cerr << "  Unknown error scanning process " << processes[i] << " (" << process_name << ")" << std::endl;
-                        }
-                    }
-                }
-            }
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error in scan_all_processes_memory: " << e.what() << std::endl;
-            log_message("ERROR", "Error in scan_all_processes_memory: " + std::string(e.what()));
-        }
-        catch (...) {
-            std::cerr << "Unknown error in scan_all_processes_memory" << std::endl;
-            log_message("ERROR", "Unknown error in scan_all_processes_memory");
-        }
-    }
+    //                         scanned_count++;
+    //                     }
+    //                 }
+    //                 catch (const std::exception& e) {
+    //                     std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+    //                     ProcessCategory category = classify_process(process_name);
+    //                     if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
+    //                         std::cerr << "  Error scanning process " << processes[i] << " (" << process_name << "): " << e.what() << std::endl;
+    //                     }
+    //                 }
+    //                 catch (...) {
+    //                     std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+    //                     ProcessCategory category = classify_process(process_name);
+    //                     if (category == ProcessCategory::ATTACK_SIMULATOR || category == ProcessCategory::HIGH_RISK_PROCESS) {
+    //                         std::cerr << "  Unknown error scanning process " << processes[i] << " (" << process_name << ")" << std::endl;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     catch (const std::exception& e) {
+    //         std::cerr << "Error in scan_all_processes_memory: " << e.what() << std::endl;
+    //         log_message("ERROR", "Error in scan_all_processes_memory: " + std::string(e.what()));
+    //     }
+    //     catch (...) {
+    //         std::cerr << "Unknown error in scan_all_processes_memory" << std::endl;
+    //         log_message("ERROR", "Unknown error in scan_all_processes_memory");
+    //     }
+    // }
 
-    void deep_scan_process(DWORD process_id) {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
-        if (!hProcess) {
-            return;
-        }
+    // void deep_scan_process(DWORD process_id) {
+    //     HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process_id);
+    //     if (!hProcess) {
+    //         return;
+    //     }
         
-        std::string process_name = MemoryMonitor::get_process_name(process_id);
-        ProcessCategory category = classify_process(process_name);
-        bool is_attack_simulator = (process_name.find("attack_simulator") != std::string::npos);
+    //     std::string process_name = MemoryMonitor::get_process_name(process_id);
+    //     ProcessCategory category = classify_process(process_name);
+    //     bool is_attack_simulator = (process_name.find("attack_simulator") != std::string::npos);
         
-        if (is_attack_simulator) {
-            std::cout << "    *** Starting deep scan for process " << process_id << " ***" << std::endl;
-            log_message("DEBUG", "*** Starting deep scan for process " + std::to_string(process_id) + " ***");
-        }
+    //     if (is_attack_simulator) {
+    //         std::cout << "    *** Starting deep scan for process " << process_id << " ***" << std::endl;
+    //         log_message("DEBUG", "*** Starting deep scan for process " + std::to_string(process_id) + " ***");
+    //     }
         
-        // 新增：對攻擊模擬器執行分散式ROP檢測
-        if (category == ProcessCategory::ATTACK_SIMULATOR) {
-            detect_scattered_rop_chains(process_id, hProcess);
-        }
+    //     // 新增：對攻擊模擬器執行分散式ROP檢測
+    //     if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //         detect_scattered_rop_chains(process_id, hProcess);
+    //     }
         
-        // 使用智能掃描替代傳統掃描
-        if (is_attack_simulator) {
-            std::cout << "    *** Calling smart_scan_process for attack simulator ***" << std::endl;
-            log_message("DEBUG", "*** Calling smart_scan_process for attack simulator ***");
-        }
-        smart_scan_process(process_id, hProcess, category);
+    //     // 使用智能掃描替代傳統掃描
+    //     if (is_attack_simulator) {
+    //         std::cout << "    *** Calling smart_scan_process for attack simulator ***" << std::endl;
+    //         log_message("DEBUG", "*** Calling smart_scan_process for attack simulator ***");
+    //     }
+    //     smart_scan_process(process_id, hProcess, category);
         
-        // 新增：執行全面攻擊檢測
-        perform_comprehensive_attack_detection(process_id, hProcess, category);
+    //     // 新增：執行全面攻擊檢測
+    //     perform_comprehensive_attack_detection(process_id, hProcess, category);
         
-        if (is_attack_simulator) {
-            std::cout << "    *** Deep scan completed for process " << process_id << " ***" << std::endl;
-            log_message("DEBUG", "*** Deep scan completed for process " + std::to_string(process_id) + " ***");
-        }
+    //     if (is_attack_simulator) {
+    //         std::cout << "    *** Deep scan completed for process " << process_id << " ***" << std::endl;
+    //         log_message("DEBUG", "*** Deep scan completed for process " + std::to_string(process_id) + " ***");
+    //     }
         
-        CloseHandle(hProcess);
-    }
+    //     CloseHandle(hProcess);
+    // }
 
     void check_executable_integrity(LPVOID base, SIZE_T size) {
         try {
@@ -1550,391 +1558,391 @@ private:
         }
     }
 
-    void check_executable_integrity_remote(HANDLE hProcess, LPVOID base, SIZE_T size) {
-        // 限制檢查的記憶體大小，避免過度消耗
-        if (size > 4096) { // 限制到4KB
-            size = 4096;
-        }
+    // void check_executable_integrity_remote(HANDLE hProcess, LPVOID base, SIZE_T size) {
+    //     // 限制檢查的記憶體大小，避免過度消耗
+    //     if (size > 4096) { // 限制到4KB
+    //         size = 4096;
+    //     }
 
-        MEMORY_BASIC_INFORMATION mbi;
-        VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi));
+    //     MEMORY_BASIC_INFORMATION mbi;
+    //     VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi));
         
-        // 模擬器測試區域通常具有特殊保護屬性
-        if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
-            log_message("DEBUG", "Simulator RWX region, lower confidence");
-            return;
-        }
+    //     // 模擬器測試區域通常具有特殊保護屬性
+    //     if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
+    //         log_message("DEBUG", "Simulator RWX region, lower confidence");
+    //         return;
+    //     }
         
-        std::vector<uint8_t> buffer(size);
-        SIZE_T bytes_read = 0;
+    //     std::vector<uint8_t> buffer(size);
+    //     SIZE_T bytes_read = 0;
         
-        if (ReadProcessMemory(hProcess, base, buffer.data(), size, &bytes_read)) {
-            // 獲取進程ID和名稱
-            DWORD process_id = GetProcessId(hProcess);
-            std::string process_name = MemoryMonitor::get_process_name(process_id);
-            ProcessCategory category = classify_process(process_name);
+    //     if (ReadProcessMemory(hProcess, base, buffer.data(), size, &bytes_read)) {
+    //         // 獲取進程ID和名稱
+    //         DWORD process_id = GetProcessId(hProcess);
+    //         std::string process_name = MemoryMonitor::get_process_name(process_id);
+    //         ProcessCategory category = classify_process(process_name);
             
-            // 檢查是否在白名單中（但攻擊模擬器除外）
-            if (is_whitelisted_process(process_name) && category != ProcessCategory::ATTACK_SIMULATOR) {
-                silent_whitelist_skip(process_name);
-                return;
-            }
+    //         // 檢查是否在白名單中（但攻擊模擬器除外）
+    //         if (is_whitelisted_process(process_name) && category != ProcessCategory::ATTACK_SIMULATOR) {
+    //             silent_whitelist_skip(process_name);
+    //             return;
+    //         }
 
-            // 首先檢查是否為heap corruption區域，如果是則跳過ROP檢測
-            int corruption_patterns = 0;
-            for (size_t i = 0; i < bytes_read - 4; i++) {
-                uint32_t value = *(uint32_t*)(&buffer[i]);
-                if (value == 0xDEADBEEF || 
-                    value == 0xBAADF00D ||
-                    value == 0xFEEEFEEE ||
-                    value == 0xCDCDCDCD ||
-                    value == 0xABABABAB) {
-                    corruption_patterns++;
-                }
-            }
+    //         // 首先檢查是否為heap corruption區域，如果是則跳過ROP檢測
+    //         int corruption_patterns = 0;
+    //         for (size_t i = 0; i < bytes_read - 4; i++) {
+    //             uint32_t value = *(uint32_t*)(&buffer[i]);
+    //             if (value == 0xDEADBEEF || 
+    //                 value == 0xBAADF00D ||
+    //                 value == 0xFEEEFEEE ||
+    //                 value == 0xCDCDCDCD ||
+    //                 value == 0xABABABAB) {
+    //                 corruption_patterns++;
+    //             }
+    //         }
             
-            // 只有在檢測到足夠多的heap corruption模式時才跳過ROP檢測
-            // 使用更嚴格的閾值，避免誤判正常記憶體區域
-            int corruption_threshold = get_heap_corruption_threshold(category);
-            // 對於攻擊模擬器，提高閾值避免誤判
-            if (category == ProcessCategory::ATTACK_SIMULATOR) {
-                corruption_threshold = corruption_threshold * 3; // 提高3倍閾值
-            }
-            if (corruption_patterns >= corruption_threshold) {
-                // 調試輸出
-                std::cout << "    *** SKIPPING ROP DETECTION due to heap corruption patterns: " << corruption_patterns << " (threshold: " << corruption_threshold << ") ***" << std::endl;
-                log_message("DEBUG", "*** SKIPPING ROP DETECTION due to heap corruption patterns: " + std::to_string(corruption_patterns) + " (threshold: " + std::to_string(corruption_threshold) + ") ***");
-                return; // 跳過ROP檢測，讓heap檢測函數處理
-            }
+    //         // 只有在檢測到足夠多的heap corruption模式時才跳過ROP檢測
+    //         // 使用更嚴格的閾值，避免誤判正常記憶體區域
+    //         int corruption_threshold = get_heap_corruption_threshold(category);
+    //         // 對於攻擊模擬器，提高閾值避免誤判
+    //         if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //             corruption_threshold = corruption_threshold * 3; // 提高3倍閾值
+    //         }
+    //         if (corruption_patterns >= corruption_threshold) {
+    //             // 調試輸出
+    //             std::cout << "    *** SKIPPING ROP DETECTION due to heap corruption patterns: " << corruption_patterns << " (threshold: " << corruption_threshold << ") ***" << std::endl;
+    //             log_message("DEBUG", "*** SKIPPING ROP DETECTION due to heap corruption patterns: " + std::to_string(corruption_patterns) + " (threshold: " + std::to_string(corruption_threshold) + ") ***");
+    //             return; // 跳過ROP檢測，讓heap檢測函數處理
+    //         }
 
-            // 獲取shellcode閾值
-            int shellcode_threshold = get_shellcode_threshold(category);
+    //         // 獲取shellcode閾值
+    //         int shellcode_threshold = get_shellcode_threshold(category);
             
-            // 檢查shellcode模式 - 更精確的檢測
-            int shellcode_patterns = 0;
+    //         // 檢查shellcode模式 - 更精確的檢測
+    //         int shellcode_patterns = 0;
             
-            for (size_t i = 0; i < bytes_read - 3; i++) {
-                // 檢查連續的NOP sled（需要更多連續NOP才計數）
-                if (buffer[i] == 0x90 && buffer[i+1] == 0x90 && buffer[i+2] == 0x90) {
-                    // 檢查是否有更多連續的NOP
-                    int consecutive_nops = 3;
-                    for (size_t j = i + 3; j < bytes_read && j < i + 10 && buffer[j] == 0x90; j++) {
-                        consecutive_nops++;
-                    }
-                    if (consecutive_nops >= 5) { // 至少5個連續NOP才計數
-                        shellcode_patterns++;
-                    }
-                }
+    //         for (size_t i = 0; i < bytes_read - 3; i++) {
+    //             // 檢查連續的NOP sled（需要更多連續NOP才計數）
+    //             if (buffer[i] == 0x90 && buffer[i+1] == 0x90 && buffer[i+2] == 0x90) {
+    //                 // 檢查是否有更多連續的NOP
+    //                 int consecutive_nops = 3;
+    //                 for (size_t j = i + 3; j < bytes_read && j < i + 10 && buffer[j] == 0x90; j++) {
+    //                     consecutive_nops++;
+    //                 }
+    //                 if (consecutive_nops >= 5) { // 至少5個連續NOP才計數
+    //                     shellcode_patterns++;
+    //                 }
+    //             }
                 
-                // 檢查連續的INT3 sled（需要更多連續INT3才計數）
-                if (buffer[i] == 0xCC && buffer[i+1] == 0xCC && buffer[i+2] == 0xCC) {
-                    // 檢查是否有更多連續的INT3
-                    int consecutive_int3 = 3;
-                    for (size_t j = i + 3; j < bytes_read && j < i + 10 && buffer[j] == 0xCC; j++) {
-                        consecutive_int3++;
-                    }
-                    if (consecutive_int3 >= 5) { // 至少5個連續INT3才計數
-                        shellcode_patterns++;
-                    }
-                }
+    //             // 檢查連續的INT3 sled（需要更多連續INT3才計數）
+    //             if (buffer[i] == 0xCC && buffer[i+1] == 0xCC && buffer[i+2] == 0xCC) {
+    //                 // 檢查是否有更多連續的INT3
+    //                 int consecutive_int3 = 3;
+    //                 for (size_t j = i + 3; j < bytes_read && j < i + 10 && buffer[j] == 0xCC; j++) {
+    //                     consecutive_int3++;
+    //                 }
+    //                 if (consecutive_int3 >= 5) { // 至少5個連續INT3才計數
+    //                     shellcode_patterns++;
+    //                 }
+    //             }
                 
-                // 檢查更複雜的shellcode指令組合（更嚴格的條件）
-                if (buffer[i] == 0x31 && buffer[i+1] == 0xC0) { // xor eax, eax
-                    // 只有在後面跟著明顯的shellcode特徵時才計數
-                    if (i + 5 < bytes_read) {
-                        // 檢查是否為典型的shellcode序列
-                        if (buffer[i+2] == 0x31 && buffer[i+3] == 0xDB && 
-                            (buffer[i+4] == 0x31 || buffer[i+4] == 0x50)) { // xor ebx, ebx + 其他指令
-                            shellcode_patterns += 2; // 給予更高權重
-                        } else if (buffer[i+2] == 0x50 && buffer[i+3] == 0x68) { // push eax + push
-                            shellcode_patterns++;
-                        } else if (buffer[i+2] == 0x90 && buffer[i+3] == 0x90) { // 跟著NOP sled
-                            shellcode_patterns++;
-                        } else {
-                            // 單獨的xor eax, eax不計數，避免誤判ROP gadgets
-                            // shellcode_patterns++; // 註釋掉，避免誤判
-                        }
-                    } else {
-                        // 單獨的xor eax, eax不計數
-                        // shellcode_patterns++; // 註釋掉，避免誤判
-                    }
-                }
+    //             // 檢查更複雜的shellcode指令組合（更嚴格的條件）
+    //             if (buffer[i] == 0x31 && buffer[i+1] == 0xC0) { // xor eax, eax
+    //                 // 只有在後面跟著明顯的shellcode特徵時才計數
+    //                 if (i + 5 < bytes_read) {
+    //                     // 檢查是否為典型的shellcode序列
+    //                     if (buffer[i+2] == 0x31 && buffer[i+3] == 0xDB && 
+    //                         (buffer[i+4] == 0x31 || buffer[i+4] == 0x50)) { // xor ebx, ebx + 其他指令
+    //                         shellcode_patterns += 2; // 給予更高權重
+    //                     } else if (buffer[i+2] == 0x50 && buffer[i+3] == 0x68) { // push eax + push
+    //                         shellcode_patterns++;
+    //                     } else if (buffer[i+2] == 0x90 && buffer[i+3] == 0x90) { // 跟著NOP sled
+    //                         shellcode_patterns++;
+    //                     } else {
+    //                         // 單獨的xor eax, eax不計數，避免誤判ROP gadgets
+    //                         // shellcode_patterns++; // 註釋掉，避免誤判
+    //                     }
+    //                 } else {
+    //                     // 單獨的xor eax, eax不計數
+    //                     // shellcode_patterns++; // 註釋掉，避免誤判
+    //                 }
+    //             }
                 
-                // 檢查其他shellcode特徵（更嚴格）
-                if (buffer[i] == 0x31 && buffer[i+1] == 0xDB) { // xor ebx, ebx
-                    // 只有在後面跟著明顯的shellcode特徵時才計數
-                    if (i + 3 < bytes_read && buffer[i+2] == 0x31) { // 跟著另一個xor指令
-                        shellcode_patterns++;
-                    }
-                }
+    //             // 檢查其他shellcode特徵（更嚴格）
+    //             if (buffer[i] == 0x31 && buffer[i+1] == 0xDB) { // xor ebx, ebx
+    //                 // 只有在後面跟著明顯的shellcode特徵時才計數
+    //                 if (i + 3 < bytes_read && buffer[i+2] == 0x31) { // 跟著另一個xor指令
+    //                     shellcode_patterns++;
+    //                 }
+    //             }
                 
-                // 檢查shellcode中的API調用模式
-                if (buffer[i] == 0xE8) { // call指令
-                    // 檢查是否為相對調用（shellcode特徵）
-                    if (i + 4 < bytes_read) {
-                        // 檢查調用目標是否在合理範圍內
-                        int32_t offset = *(int32_t*)(&buffer[i+1]);
-                        if (offset > -0x1000000 && offset < 0x1000000) {
-                            shellcode_patterns++;
-                        }
-                    }
-                }
-            }
+    //             // 檢查shellcode中的API調用模式
+    //             if (buffer[i] == 0xE8) { // call指令
+    //                 // 檢查是否為相對調用（shellcode特徵）
+    //                 if (i + 4 < bytes_read) {
+    //                     // 檢查調用目標是否在合理範圍內
+    //                     int32_t offset = *(int32_t*)(&buffer[i+1]);
+    //                     if (offset > -0x1000000 && offset < 0x1000000) {
+    //                         shellcode_patterns++;
+    //                     }
+    //                 }
+    //             }
+    //         }
             
-            // ROP檢測已移至 detect_scattered_rop_chains 函數
-            // 此處僅保留shellcode檢測邏輯
+    //         // ROP檢測已移至 detect_scattered_rop_chains 函數
+    //         // 此處僅保留shellcode檢測邏輯
             
-            // 檢查shellcode模式並計算置信度
-            double shellcode_confidence = 0.0;
-            bool is_shellcode_attack = false;
-            bool has_suspicious_context = false;
-            std::string context_description = "";
+    //         // 檢查shellcode模式並計算置信度
+    //         double shellcode_confidence = 0.0;
+    //         bool is_shellcode_attack = false;
+    //         bool has_suspicious_context = false;
+    //         std::string context_description = "";
             
-            if (shellcode_patterns > 0) {
-                // 檢測shellcode的上下文（是否與其他攻擊結合）
+    //         if (shellcode_patterns > 0) {
+    //             // 檢測shellcode的上下文（是否與其他攻擊結合）
                 
-                // 1. 檢查是否為RWX記憶體區域（高度可疑）
-                MEMORY_BASIC_INFORMATION mbi;
-                if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
-                    if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
-                        has_suspicious_context = true;
-                        context_description += "RWX memory region; ";
-                    }
-                    // 新增：檢測PAGE_EXECUTE_WRITECOPY（攻擊模擬器使用的權限混淆技術）
-                    if (mbi.Protect & PAGE_EXECUTE_WRITECOPY) {
-                        has_suspicious_context = true;
-                        context_description += "PAGE_EXECUTE_WRITECOPY memory region; ";
-                    }
-                }
+    //             // 1. 檢查是否為RWX記憶體區域（高度可疑）
+    //             MEMORY_BASIC_INFORMATION mbi;
+    //             if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
+    //                 if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
+    //                     has_suspicious_context = true;
+    //                     context_description += "RWX memory region; ";
+    //                 }
+    //                 // 新增：檢測PAGE_EXECUTE_WRITECOPY（攻擊模擬器使用的權限混淆技術）
+    //                 if (mbi.Protect & PAGE_EXECUTE_WRITECOPY) {
+    //                     has_suspicious_context = true;
+    //                     context_description += "PAGE_EXECUTE_WRITECOPY memory region; ";
+    //                 }
+    //             }
                 
-                // 2. 檢查是否有堆積破壞特徵（堆積破壞 + Shellcode組合）
-                if (corruption_patterns > 0) {
-                    has_suspicious_context = true;
-                    context_description += "heap corruption patterns detected; ";
-                }
+    //             // 2. 檢查是否有堆積破壞特徵（堆積破壞 + Shellcode組合）
+    //             if (corruption_patterns > 0) {
+    //                 has_suspicious_context = true;
+    //                 context_description += "heap corruption patterns detected; ";
+    //             }
                 
-                // 3. 檢查是否在堆疊區域（可能與緩衝區溢出結合）
-                if ((uint64_t)base >= 0x7FFE0000 && (uint64_t)base <= 0x7FFFFFFF) {
-                    has_suspicious_context = true;
-                    context_description += "stack region; ";
-                }
+    //             // 3. 檢查是否在堆疊區域（可能與緩衝區溢出結合）
+    //             if ((uint64_t)base >= 0x7FFE0000 && (uint64_t)base <= 0x7FFFFFFF) {
+    //                 has_suspicious_context = true;
+    //                 context_description += "stack region; ";
+    //             }
                 
-                // 4. ROP檢測已移至 detect_scattered_rop_chains 函數
+    //             // 4. ROP檢測已移至 detect_scattered_rop_chains 函數
                 
-                // 5. 檢查是否有注入特徵 - 提高要求
-                double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
-                if (process_name.find("explorer") == std::string::npos && 
-                    process_name.find("svchost") == std::string::npos &&
-                    entropy > 6.5) { // 提高熵值要求
-                    has_suspicious_context = true;
-                    context_description += "high entropy in non-system process; ";
-                }
+    //             // 5. 檢查是否有注入特徵 - 提高要求
+    //             double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
+    //             if (process_name.find("explorer") == std::string::npos && 
+    //                 process_name.find("svchost") == std::string::npos &&
+    //                 entropy > 6.5) { // 提高熵值要求
+    //                 has_suspicious_context = true;
+    //                 context_description += "high entropy in non-system process; ";
+    //             }
                 
-                // 對於攻擊模擬器，使用更寬鬆的上下文檢測
-                if (category == ProcessCategory::ATTACK_SIMULATOR) {
-                    // 檢查是否為模擬器特有的合法模式
-                    bool is_simulator_legitimate = false;
+    //             // 對於攻擊模擬器，使用更寬鬆的上下文檢測
+    //             if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //                 // 檢查是否為模擬器特有的合法模式
+    //                 bool is_simulator_legitimate = false;
                     
-                    // 檢查是否包含模擬器標記
-                    for (size_t i = 0; i < bytes_read - 4; i++) {
-                        if (*(uint32_t*)(&buffer[i]) == 0x53494D55) { // 'SIMU'
-                            is_simulator_legitimate = true;
-                            break;
-                        }
-                    }
+    //                 // 檢查是否包含模擬器標記
+    //                 for (size_t i = 0; i < bytes_read - 4; i++) {
+    //                     if (*(uint32_t*)(&buffer[i]) == 0x53494D55) { // 'SIMU'
+    //                         is_simulator_legitimate = true;
+    //                         break;
+    //                     }
+    //                 }
                     
-                    // 檢查是否為模擬器的測試代碼
-                    int test_patterns = 0;
-                    for (size_t i = 0; i < bytes_read - 2; i++) {
-                        if (buffer[i] == 0x90 && buffer[i+1] == 0x90) test_patterns++;
-                        if (buffer[i] == 0xCC && buffer[i+1] == 0xCC) test_patterns++;
-                    }
+    //                 // 檢查是否為模擬器的測試代碼
+    //                 int test_patterns = 0;
+    //                 for (size_t i = 0; i < bytes_read - 2; i++) {
+    //                     if (buffer[i] == 0x90 && buffer[i+1] == 0x90) test_patterns++;
+    //                     if (buffer[i] == 0xCC && buffer[i+1] == 0xCC) test_patterns++;
+    //                 }
                     
-                    // 如果檢測到太多測試模式，可能是模擬器的正常行為
-                    if (test_patterns > bytes_read / 50) {
-                        is_simulator_legitimate = true;
-                    }
+    //                 // 如果檢測到太多測試模式，可能是模擬器的正常行為
+    //                 if (test_patterns > bytes_read / 50) {
+    //                     is_simulator_legitimate = true;
+    //                 }
                     
-                                            // 對於攻擊模擬器，簡化檢測條件，提高檢測率
-                        if (shellcode_patterns >= 5) { // 降低shellcode模式要求
-                            // 簡化攻擊模擬器的shellcode檢測
-                            double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
+    //                                         // 對於攻擊模擬器，簡化檢測條件，提高檢測率
+    //                     if (shellcode_patterns >= 5) { // 降低shellcode模式要求
+    //                         // 簡化攻擊模擬器的shellcode檢測
+    //                         double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
                             
-                            // 計算shellcode置信度
-                            bool is_valid_shellcode_detected = is_valid_shellcode_ex(buffer.data(), bytes_read, hProcess);
+    //                         // 計算shellcode置信度
+    //                         bool is_valid_shellcode_detected = is_valid_shellcode_ex(buffer.data(), bytes_read, hProcess);
                             
-                            // 使用shellcode評分函數
-                            int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
-                                                                          shellcode_patterns, entropy, 
-                                                                          is_valid_shellcode_detected, category);
+    //                         // 使用shellcode評分函數
+    //                         int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
+    //                                                                       shellcode_patterns, entropy, 
+    //                                                                       is_valid_shellcode_detected, category);
                             
-                            int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
-                                                                                          category, process_name, entropy);
+    //                         int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
+    //                                                                                       category, process_name, entropy);
                             
-                            // 對於攻擊模擬器，使用更寬鬆的驗證條件
-                            bool has_high_entropy = entropy > 4.5; // 降低熵值要求
-                            bool has_valid_instructions = count_valid_instructions(buffer.data(), bytes_read) > bytes_read * 0.1; // 降低有效指令比例要求
+    //                         // 對於攻擊模擬器，使用更寬鬆的驗證條件
+    //                         bool has_high_entropy = entropy > 4.5; // 降低熵值要求
+    //                         bool has_valid_instructions = count_valid_instructions(buffer.data(), bytes_read) > bytes_read * 0.1; // 降低有效指令比例要求
                             
-                            // 調試輸出
-                            std::string debug_key = "shellcode_context_" + std::to_string(process_id);
-                            std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
-                                                  ", patterns=" + std::to_string(shellcode_patterns) + 
-                                                  ", score=" + std::to_string(shellcode_score) + 
-                                                  ", threshold=" + std::to_string(adjusted_threshold) + 
-                                                  ", entropy=" + std::to_string(entropy) + 
-                                                  ", has_context=" + std::to_string(has_suspicious_context) + 
-                                                  ", context=" + context_description + " ***";
-                            controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
-                            controlled_log_output(debug_key, debug_msg, 1, 60);
+    //                         // 調試輸出
+    //                         std::string debug_key = "shellcode_context_" + std::to_string(process_id);
+    //                         std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
+    //                                               ", patterns=" + std::to_string(shellcode_patterns) + 
+    //                                               ", score=" + std::to_string(shellcode_score) + 
+    //                                               ", threshold=" + std::to_string(adjusted_threshold) + 
+    //                                               ", entropy=" + std::to_string(entropy) + 
+    //                                               ", has_context=" + std::to_string(has_suspicious_context) + 
+    //                                               ", context=" + context_description + " ***";
+    //                         controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
+    //                         controlled_log_output(debug_key, debug_msg, 1, 60);
                             
-                            // 使用更寬鬆的檢測條件
-                            if (shellcode_score >= adjusted_threshold * 0.9 && 
-                                shellcode_patterns >= get_shellcode_threshold(category) * 0.5 &&
-                                has_high_entropy && has_valid_instructions) {
+    //                         // 使用更寬鬆的檢測條件
+    //                         if (shellcode_score >= adjusted_threshold * 0.9 && 
+    //                             shellcode_patterns >= get_shellcode_threshold(category) * 0.5 &&
+    //                             has_high_entropy && has_valid_instructions) {
                             
-                            // 使用shellcode評分函數
-                            int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
-                                                                          shellcode_patterns, entropy, 
-                                                                          is_valid_shellcode_detected, category);
+    //                         // 使用shellcode評分函數
+    //                         int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
+    //                                                                       shellcode_patterns, entropy, 
+    //                                                                       is_valid_shellcode_detected, category);
                             
-                            int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
-                                                                                          category, process_name, entropy);
+    //                         int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
+    //                                                                                       category, process_name, entropy);
                             
-                            // 對於攻擊模擬器，使用更嚴格的驗證條件
-                            bool has_high_entropy = entropy > 5.0; // 提高熵值要求
-                            bool has_valid_instructions = count_valid_instructions(buffer.data(), bytes_read) > bytes_read * 0.15; // 提高有效指令比例要求
+    //                         // 對於攻擊模擬器，使用更嚴格的驗證條件
+    //                         bool has_high_entropy = entropy > 5.0; // 提高熵值要求
+    //                         bool has_valid_instructions = count_valid_instructions(buffer.data(), bytes_read) > bytes_read * 0.15; // 提高有效指令比例要求
                             
-                            // 調試輸出
-                            std::string debug_key = "shellcode_context_" + std::to_string(process_id);
-                            std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
-                                                  ", patterns=" + std::to_string(shellcode_patterns) + 
-                                                  ", score=" + std::to_string(shellcode_score) + 
-                                                  ", threshold=" + std::to_string(adjusted_threshold) + 
-                                                  ", entropy=" + std::to_string(entropy) + 
-                                                  ", has_context=" + std::to_string(has_suspicious_context) + 
-                                                  ", context=" + context_description + 
-                                                  " ***";
-                            controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
-                            controlled_log_output(debug_key, debug_msg, 1, 60);
+    //                         // 調試輸出
+    //                         std::string debug_key = "shellcode_context_" + std::to_string(process_id);
+    //                         std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
+    //                                               ", patterns=" + std::to_string(shellcode_patterns) + 
+    //                                               ", score=" + std::to_string(shellcode_score) + 
+    //                                               ", threshold=" + std::to_string(adjusted_threshold) + 
+    //                                               ", entropy=" + std::to_string(entropy) + 
+    //                                               ", has_context=" + std::to_string(has_suspicious_context) + 
+    //                                               ", context=" + context_description + 
+    //                                               " ***";
+    //                         controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
+    //                         controlled_log_output(debug_key, debug_msg, 1, 60);
                             
-                            // 使用更嚴格的檢測條件
-                            if (shellcode_score >= adjusted_threshold * 0.9 && 
-                                shellcode_patterns >= get_shellcode_threshold(category) * 0.6 &&
-                                has_high_entropy && has_valid_instructions) {
-                                is_shellcode_attack = true;
+    //                         // 使用更嚴格的檢測條件
+    //                         if (shellcode_score >= adjusted_threshold * 0.9 && 
+    //                             shellcode_patterns >= get_shellcode_threshold(category) * 0.6 &&
+    //                             has_high_entropy && has_valid_instructions) {
+    //                             is_shellcode_attack = true;
                                 
-                                // 動態計算shellcode置信度
-                                double base_confidence = 0.3; // 降低基礎置信度
+    //                             // 動態計算shellcode置信度
+    //                             double base_confidence = 0.3; // 降低基礎置信度
                                 
-                                // 基於評分調整
-                                double score_bonus = (shellcode_score - adjusted_threshold) * 0.01;
+    //                             // 基於評分調整
+    //                             double score_bonus = (shellcode_score - adjusted_threshold) * 0.01;
                                 
-                                // 基於熵值調整
-                                double entropy_bonus = 0.0;
-                                if (entropy > 6.5) entropy_bonus = 0.2;
-                                else if (entropy > 5.5) entropy_bonus = 0.15;
-                                else if (entropy > 5.0) entropy_bonus = 0.1;
+    //                             // 基於熵值調整
+    //                             double entropy_bonus = 0.0;
+    //                             if (entropy > 6.5) entropy_bonus = 0.2;
+    //                             else if (entropy > 5.5) entropy_bonus = 0.15;
+    //                             else if (entropy > 5.0) entropy_bonus = 0.1;
                                 
-                                // 基於記憶體保護調整
-                                double protection_bonus = 0.0;
-                                MEMORY_BASIC_INFORMATION mbi;
-                                if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
-                                    if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
-                                        protection_bonus = 0.15; // RWX記憶體獎勵
-                                    }
-                                }
+    //                             // 基於記憶體保護調整
+    //                             double protection_bonus = 0.0;
+    //                             MEMORY_BASIC_INFORMATION mbi;
+    //                             if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
+    //                                 if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
+    //                                     protection_bonus = 0.15; // RWX記憶體獎勵
+    //                                 }
+    //                             }
                                 
-                                // 基於上下文調整
-                                double context_bonus = 0.0;
-                                if (has_suspicious_context) context_bonus = 0.1;
+    //                             // 基於上下文調整
+    //                             double context_bonus = 0.0;
+    //                             if (has_suspicious_context) context_bonus = 0.1;
                                 
-                                shellcode_confidence = base_confidence + score_bonus + entropy_bonus + protection_bonus + context_bonus;
-                                shellcode_confidence = std::min(shellcode_confidence, 0.85); // 最高0.85
-                                shellcode_confidence = std::max(shellcode_confidence, 0.3); // 最低0.3
-                            }
-                        }
-                    }
-                } else {
-                    // 其他進程的shellcode檢測 - 需要可疑上下文
-                    if (has_suspicious_context) {
-                        double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
-                        bool is_valid_shellcode_detected = is_valid_shellcode_ex(buffer.data(), bytes_read, hProcess);
+    //                             shellcode_confidence = base_confidence + score_bonus + entropy_bonus + protection_bonus + context_bonus;
+    //                             shellcode_confidence = std::min(shellcode_confidence, 0.85); // 最高0.85
+    //                             shellcode_confidence = std::max(shellcode_confidence, 0.3); // 最低0.3
+    //                         }
+    //                     }
+    //                 }
+    //             } else {
+    //                 // 其他進程的shellcode檢測 - 需要可疑上下文
+    //                 if (has_suspicious_context) {
+    //                     double entropy = MemoryMonitor::calculate_shannon_entropy(buffer.data(), bytes_read, process_name);
+    //                     bool is_valid_shellcode_detected = is_valid_shellcode_ex(buffer.data(), bytes_read, hProcess);
                         
-                        int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
-                                                                      shellcode_patterns, entropy, 
-                                                                      is_valid_shellcode_detected, category);
+    //                     int shellcode_score = calculate_shellcode_score(buffer.data(), bytes_read, 
+    //                                                                   shellcode_patterns, entropy, 
+    //                                                                   is_valid_shellcode_detected, category);
                         
-                        int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
-                                                                                      category, process_name, entropy);
+    //                     int adjusted_threshold = calculate_adjusted_shellcode_threshold(shellcode_threshold, 
+    //                                                                                   category, process_name, entropy);
                         
-                        // 調試輸出
-                        std::string debug_key = "shellcode_context_" + std::to_string(process_id);
-                        std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
-                                              ", patterns=" + std::to_string(shellcode_patterns) + 
-                                              ", score=" + std::to_string(shellcode_score) + 
-                                              ", threshold=" + std::to_string(adjusted_threshold) + 
-                                              ", entropy=" + std::to_string(entropy) + 
-                                              ", has_context=" + std::to_string(has_suspicious_context) + 
-                                              ", context=" + context_description + " ***";
-                        controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
-                        controlled_log_output(debug_key, debug_msg, 1, 60);
+    //                     // 調試輸出
+    //                     std::string debug_key = "shellcode_context_" + std::to_string(process_id);
+    //                     std::string debug_msg = "*** SHELLCODE CONTEXT: address=" + format_address((uint64_t)base) + 
+    //                                           ", patterns=" + std::to_string(shellcode_patterns) + 
+    //                                           ", score=" + std::to_string(shellcode_score) + 
+    //                                           ", threshold=" + std::to_string(adjusted_threshold) + 
+    //                                           ", entropy=" + std::to_string(entropy) + 
+    //                                           ", has_context=" + std::to_string(has_suspicious_context) + 
+    //                                           ", context=" + context_description + " ***";
+    //                     controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
+    //                     controlled_log_output(debug_key, debug_msg, 1, 60);
                         
-                        if (shellcode_score >= adjusted_threshold && shellcode_patterns >= get_shellcode_threshold(category)) {
-                            is_shellcode_attack = true;
+    //                     if (shellcode_score >= adjusted_threshold && shellcode_patterns >= get_shellcode_threshold(category)) {
+    //                         is_shellcode_attack = true;
                             
-                            // 動態計算shellcode置信度
-                            double base_confidence = 0.25; // 降低基礎置信度
+    //                         // 動態計算shellcode置信度
+    //                         double base_confidence = 0.25; // 降低基礎置信度
                             
-                            // 基於評分調整
-                            double score_bonus = (shellcode_score - adjusted_threshold) * 0.005;
+    //                         // 基於評分調整
+    //                         double score_bonus = (shellcode_score - adjusted_threshold) * 0.005;
                             
-                            // 基於熵值調整
-                            double entropy_bonus = 0.0;
-                            if (entropy > 7.0) entropy_bonus = 0.25;
-                            else if (entropy > 6.0) entropy_bonus = 0.2;
-                            else if (entropy > 5.5) entropy_bonus = 0.15;
+    //                         // 基於熵值調整
+    //                         double entropy_bonus = 0.0;
+    //                         if (entropy > 7.0) entropy_bonus = 0.25;
+    //                         else if (entropy > 6.0) entropy_bonus = 0.2;
+    //                         else if (entropy > 5.5) entropy_bonus = 0.15;
                             
-                            // 基於記憶體保護調整
-                            double protection_bonus = 0.0;
-                            MEMORY_BASIC_INFORMATION mbi;
-                            if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
-                                if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
-                                    protection_bonus = 0.2; // RWX記憶體獎勵
-                                }
-                            }
+    //                         // 基於記憶體保護調整
+    //                         double protection_bonus = 0.0;
+    //                         MEMORY_BASIC_INFORMATION mbi;
+    //                         if (VirtualQueryEx(hProcess, base, &mbi, sizeof(mbi))) {
+    //                             if (mbi.Protect & PAGE_EXECUTE_READWRITE) {
+    //                                 protection_bonus = 0.2; // RWX記憶體獎勵
+    //                             }
+    //                         }
                             
-                            // 根據上下文調整置信度
-                            double context_bonus = 0.0;
-                            if (context_description.find("ROP") != std::string::npos) {
-                                context_bonus += 0.15; // ROP + Shellcode組合
-                            }
-                            if (context_description.find("heap") != std::string::npos) {
-                                context_bonus += 0.1; // 堆積破壞 + Shellcode
-                            }
-                            if (context_description.find("RWX") != std::string::npos) {
-                                context_bonus += 0.15; // 可疑記憶體區域
-                            }
+    //                         // 根據上下文調整置信度
+    //                         double context_bonus = 0.0;
+    //                         if (context_description.find("ROP") != std::string::npos) {
+    //                             context_bonus += 0.15; // ROP + Shellcode組合
+    //                         }
+    //                         if (context_description.find("heap") != std::string::npos) {
+    //                             context_bonus += 0.1; // 堆積破壞 + Shellcode
+    //                         }
+    //                         if (context_description.find("RWX") != std::string::npos) {
+    //                             context_bonus += 0.15; // 可疑記憶體區域
+    //                         }
                             
-                            shellcode_confidence = base_confidence + score_bonus + entropy_bonus + protection_bonus + context_bonus;
-                            shellcode_confidence = std::min(shellcode_confidence, 0.9); // 最高0.9
-                            shellcode_confidence = std::max(shellcode_confidence, 0.25); // 最低0.25
-                        }
-                    }
-                }
-            }
+    //                         shellcode_confidence = base_confidence + score_bonus + entropy_bonus + protection_bonus + context_bonus;
+    //                         shellcode_confidence = std::min(shellcode_confidence, 0.9); // 最高0.9
+    //                         shellcode_confidence = std::max(shellcode_confidence, 0.25); // 最低0.25
+    //                     }
+    //                 }
+    //             }
+    //         }
             
-            // 新的分級檢測邏輯
-            if (is_shellcode_attack) {
-                // 如果只有shellcode而沒有其他攻擊，將其視為正常程序行為，不報告
-                // 只有在與其他攻擊組合時才報告shellcode
-                std::string debug_key = "shellcode_standalone_" + std::to_string(process_id);
-                std::string debug_msg = "*** SHELLCODE detected alone at address=" + format_address((uint64_t)base) + " - treating as normal process behavior ***";
-                controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
-                controlled_log_output(debug_key, debug_msg, 1, 60);
-                return;
-            }
-        }
-    }
+    //         // 新的分級檢測邏輯
+    //         if (is_shellcode_attack) {
+    //             // 如果只有shellcode而沒有其他攻擊，將其視為正常程序行為，不報告
+    //             // 只有在與其他攻擊組合時才報告shellcode
+    //             std::string debug_key = "shellcode_standalone_" + std::to_string(process_id);
+    //             std::string debug_msg = "*** SHELLCODE detected alone at address=" + format_address((uint64_t)base) + " - treating as normal process behavior ***";
+    //             controlled_console_output(debug_key, "    " + debug_msg, 1, 60);
+    //             controlled_log_output(debug_key, debug_msg, 1, 60);
+    //             return;
+    //         }
+    //     }
+    // }
 
     void check_heap_region_remote(HANDLE hProcess, LPVOID base, SIZE_T size) {
         // 效能優化：進一步限制檢查的記憶體大小
@@ -2138,6 +2146,36 @@ private:
             if (it != attack_patterns_.end() && it->second.detection_count > 2) {
                 log_message("DEBUG", "Suppressed shellcode report due to active ROP detection");
                 return; // 如果已有ROP報告，抑制Shellcode報告
+            }
+        }
+        
+        // 將攻擊事件加入 EventHandler 進行處理
+        if (event_handler_) {
+            Event::Type event_type = Event::Type::CUSTOM;
+            // 將 AttackType 轉換為 Event::Type
+            switch (type) {
+                case AttackType::HEAP_CORRUPTION:
+                    event_type = Event::Type::HEAP_CORRUPTION;
+                    break;
+                case AttackType::SHELLCODE_INJECTION:
+                case AttackType::ROP_CHAIN:
+                case AttackType::JOP_CHAIN:
+                case AttackType::BUFFER_OVERFLOW:
+                case AttackType::STACK_OVERFLOW:
+                case AttackType::USE_AFTER_FREE:
+                case AttackType::MEMORY_CORRUPTION:
+                default:
+                    event_type = Event::Type::CUSTOM;
+                    break;
+            }
+            Event ev = Event::make_event(event_type, target_process_id, address, 0);
+            ev.meta = description + " (confidence: " + std::to_string(confidence) + ")";
+            
+            event_handler_->enqueue_event(ev);
+            
+            // 如果是高風險攻擊，立即調度可疑區域進行深度分析
+            if (confidence > 0.7) {
+                event_handler_->schedule_suspicious_region(target_process_id, address);
             }
         }
         try {
@@ -2452,94 +2490,94 @@ private:
         }
     };
 
-    void process_monitor_loop() {
-        while (running_) {
-            try {
-                // 每20秒才進行一次進程掃描（而不是每1000毫秒）
-                scan_processes();
-                std::this_thread::sleep_for(std::chrono::seconds(20));
-            }
-            catch (const std::exception& e) {
-                std::cerr << "Process monitor thread exception: " << e.what() << std::endl;
-            }
-        }
-    }
+    // void process_monitor_loop() {
+    //     while (running_) {
+    //         try {
+    //             // 每20秒才進行一次進程掃描（而不是每1000毫秒）
+    //             scan_processes();
+    //             std::this_thread::sleep_for(std::chrono::seconds(20));
+    //         }
+    //         catch (const std::exception& e) {
+    //             std::cerr << "Process monitor thread exception: " << e.what() << std::endl;
+    //         }
+    //     }
+    // }
 
-    void scan_processes() {
-        log_message("INFO", "開始掃描進程...");
+    // void scan_processes() {
+    //     log_message("INFO", "開始掃描進程...");
         
-        DWORD processes[4096];
-        DWORD cbNeeded;
+    //     DWORD processes[4096];
+    //     DWORD cbNeeded;
         
-        if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
-            DWORD num_processes = cbNeeded / sizeof(DWORD);
-            const int max_processes_to_scan = 200;
+    //     if (EnumProcesses(processes, sizeof(processes), &cbNeeded)) {
+    //         DWORD num_processes = cbNeeded / sizeof(DWORD);
+    //         const int max_processes_to_scan = 200;
             
-            // 收集進程信息並排序
-            std::vector<PrioritizedProcess> process_list;
+    //         // 收集進程信息並排序
+    //         std::vector<PrioritizedProcess> process_list;
             
-            for (DWORD i = 0; i < num_processes; i++) {
-                if (processes[i] != 0) {
-                    std::string process_name = MemoryMonitor::get_process_name(processes[i]);
-                    if (!process_name.empty()) {
-                        int priority = MemoryMonitor::get_process_priority(processes[i], process_name);
-                        process_list.emplace_back(processes[i], process_name, priority);
-                    }
-                }
-            }
+    //         for (DWORD i = 0; i < num_processes; i++) {
+    //             if (processes[i] != 0) {
+    //                 std::string process_name = MemoryMonitor::get_process_name(processes[i]);
+    //                 if (!process_name.empty()) {
+    //                     int priority = MemoryMonitor::get_process_priority(processes[i], process_name);
+    //                     process_list.emplace_back(processes[i], process_name, priority);
+    //                 }
+    //             }
+    //         }
             
-            // 按優先級排序
-            std::sort(process_list.begin(), process_list.end());
+    //         // 按優先級排序
+    //         std::sort(process_list.begin(), process_list.end());
             
-            // 記錄前50個高優先級進程
-            log_message("INFO", "進程優先級排序（前50個）：");
-            for (size_t i = 0; i < std::min(process_list.size(), static_cast<size_t>(50)); i++) {
-                const auto& proc = process_list[i];
-                log_message("INFO", "PID: " + std::to_string(proc.pid) + 
-                           ", Name: " + proc.name + 
-                           ", Priority: " + std::to_string(proc.priority));
-            }
+    //         // 記錄前50個高優先級進程
+    //         log_message("INFO", "進程優先級排序（前50個）：");
+    //         for (size_t i = 0; i < std::min(process_list.size(), static_cast<size_t>(50)); i++) {
+    //             const auto& proc = process_list[i];
+    //             log_message("INFO", "PID: " + std::to_string(proc.pid) + 
+    //                        ", Name: " + proc.name + 
+    //                        ", Priority: " + std::to_string(proc.priority));
+    //         }
             
-            // 優先掃描高優先級進程
-            int scanned_count = 0;
-            for (const auto& proc : process_list) {
-                if (scanned_count >= max_processes_to_scan) break;
+    //         // 優先掃描高優先級進程
+    //         int scanned_count = 0;
+    //         for (const auto& proc : process_list) {
+    //             if (scanned_count >= max_processes_to_scan) break;
                 
-                if (proc.priority > 0) { // 只掃描有優先級的進程
-                    if (scanned_count % 20 == 0) {
-                    log_message("INFO", "掃描高優先級進程: " + proc.name + 
-                               " (PID: " + std::to_string(proc.pid) + 
-                               ", Priority: " + std::to_string(proc.priority) + ")");
-                    }
-                    if (proc.name.find("attack_simulator") != std::string::npos ||
-                        proc.name.find("attack") != std::string::npos) {
-                        deep_scan_process(proc.pid);
-                    } else {
-                        monitor_process(proc.pid, proc.name);
-                    }
-                    scanned_count++;
-                }
-            }
+    //             if (proc.priority > 0) { // 只掃描有優先級的進程
+    //                 if (scanned_count % 20 == 0) {
+    //                 log_message("INFO", "掃描高優先級進程: " + proc.name + 
+    //                            " (PID: " + std::to_string(proc.pid) + 
+    //                            ", Priority: " + std::to_string(proc.priority) + ")");
+    //                 }
+    //                 if (proc.name.find("attack_simulator") != std::string::npos ||
+    //                     proc.name.find("attack") != std::string::npos) {
+    //                     deep_scan_process(proc.pid);
+    //                 } else {
+    //                     monitor_process(proc.pid, proc.name);
+    //                 }
+    //                 scanned_count++;
+    //             }
+    //         }
             
-            log_message("INFO", "完成進程掃描，共掃描 " + std::to_string(scanned_count) + " 個進程");
-        }
-    }
+    //         log_message("INFO", "完成進程掃描，共掃描 " + std::to_string(scanned_count) + " 個進程");
+    //     }
+    // }
 
-    void monitor_process(DWORD process_id, const std::string& process_name) {
-        // 檢查是否為攻擊模擬器
-        if (process_name.find("attack_simulator") != std::string::npos ||
-            process_name.find("attack") != std::string::npos) {
-            log_message("INFO", "Monitoring attack simulator: " + process_name + " (PID: " + std::to_string(process_id) + ")");
+    // void monitor_process(DWORD process_id, const std::string& process_name) {
+    //     // 檢查是否為攻擊模擬器
+    //     if (process_name.find("attack_simulator") != std::string::npos ||
+    //         process_name.find("attack") != std::string::npos) {
+    //         log_message("INFO", "Monitoring attack simulator: " + process_name + " (PID: " + std::to_string(process_id) + ")");
             
-            // 對攻擊模擬器進行深度掃描
-            deep_scan_process(process_id);
-        }
+    //         // 對攻擊模擬器進行深度掃描
+    //         deep_scan_process(process_id);
+    //     }
         
-        // 簡化的進程監控
-        if (process_name.find("suspicious") != std::string::npos) {
-            report_attack(AttackType::MEMORY_CORRUPTION, 0, "Monitoring suspicious process: " + process_name, 0.3);
-        }
-    }
+    //     // 簡化的進程監控
+    //     if (process_name.find("suspicious") != std::string::npos) {
+    //         report_attack(AttackType::MEMORY_CORRUPTION, 0, "Monitoring suspicious process: " + process_name, 0.3);
+    //     }
+    // }
 
     std::string get_timestamp() {
         auto now = std::chrono::system_clock::now();
@@ -2623,30 +2661,55 @@ public:
             config.suspicious_pattern_threshold = 5;
             config.log_file = "logs/memory_monitor.log";
             
-            memory_monitor_ = std::make_unique<MemoryMonitor>(config);
+            
+            // 初始化 EventHandler
+            event_handler_ = std::make_unique<EventHandler>(config);
+            
+            // 設置違規回調 - 現在通過 EventHandler 的 MemoryMonitor 實例
+            // 注意：這個回調會在 MemoryMonitor 創建後設置
+        
+            
+            // 啟動 EventHandler 並設置依賴項
+            // 修正：創建一個獨立的 MemoryMonitor 實例，避免循環引用
+            auto* memory_monitor = new RealMemoryDetection::MemoryMonitor();
+            // 啟動 MemoryMonitor
+            if (!memory_monitor->start()) {
+                log_important("Failed to start MemoryMonitor");
+                delete memory_monitor;
+                return false;
+            }
+            log_important("MemoryMonitor started successfully");
+            
+            // 設置深度掃描回調，讓 MemoryMonitor 調用 EventHandler 的方法
+            memory_monitor->set_deep_scan_callback([this](DWORD process_id) {
+                if (event_handler_) {
+                    event_handler_->deep_scan_process(process_id);
+                }
+            });
             
             // 設置違規回調
-            memory_monitor_->set_violation_callback([this](AttackType type, uint64_t address, 
+            memory_monitor->set_violation_callback([this](AttackType type, uint64_t address, 
                                                           const std::string& description, double confidence, DWORD process_id) {
                 this->report_attack(type, address, description, confidence, process_id);
             });
             
-            // 啟動 monitor
-            if (!memory_monitor_->start()) {
-                log_warning("無法啟動記憶體監控器");
-            }
+            event_handler_->set_memory_monitor(memory_monitor);
+            event_handler_->set_detection_engine(this);
+            log_important("starting event handler");
+            event_handler_->start();
+            log_important("event handler started");
 
             // 設置運行標誌
             running_ = true;
 
             // 啟動檢測線程
-            detection_thread_ = std::thread(&DetectionEngineImpl::detection_loop, this);
+            // detection_thread_ = std::thread(&DetectionEngineImpl::detection_loop, this);
             
             // 啟動進程監控線程
-            process_monitor_thread_ = std::thread(&DetectionEngineImpl::process_monitor_loop, this);
+            // process_monitor_thread_ = std::thread(&DetectionEngineImpl::process_monitor_loop, this);
 
             // 啟動指紋清理線程
-           fingerprint_cleaner_thread_ = std::thread(&DetectionEngineImpl::fingerprint_cleaner, this);
+           fingerprint_cleaner_thread_ = std::thread(&DetectionEngine::fingerprint_cleaner, this);
 
             log_important("Detection engine started successfully");
             return true;
@@ -2666,10 +2729,10 @@ public:
         try {
             // 設置停止標誌
             running_ = false;
-
-            // 停止 memory monitor
-            if (memory_monitor_) {
-                memory_monitor_->stop();
+            
+            // 停止 EventHandler
+            if (event_handler_) {
+                event_handler_->stop();
             }
 
             // 等待檢測線程結束
@@ -2943,173 +3006,173 @@ private:
 
     // 使用已定義的ROP結構體和變數
     
-    // 新增：分散式ROP檢測方法
-    void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess) {
-        // 檢測字串寫入操作
-        detect_string_write_operations(process_id, hProcess);
+    // // 新增：分散式ROP檢測方法
+    // void detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess) {
+    //     // 檢測字串寫入操作
+    //     detect_string_write_operations(process_id, hProcess);
         
-        // 分散式ROP檢測邏輯
-        std::lock_guard<std::mutex> lock(rop_chain_mutex_);
+    //     // 分散式ROP檢測邏輯
+    //     std::lock_guard<std::mutex> lock(rop_chain_mutex_);
         
-        // 獲取進程的所有可執行記憶體區域
-        std::vector<MEMORY_BASIC_INFORMATION> exec_regions;
-        LPVOID current_address = 0;
-        MEMORY_BASIC_INFORMATION mbi;
+    //     // 獲取進程的所有可執行記憶體區域
+    //     std::vector<MEMORY_BASIC_INFORMATION> exec_regions;
+    //     LPVOID current_address = 0;
+    //     MEMORY_BASIC_INFORMATION mbi;
         
-        while (VirtualQueryEx(hProcess, current_address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT && 
-                (mbi.Protect & PAGE_EXECUTE || mbi.Protect & PAGE_EXECUTE_READ || 
-                 mbi.Protect & PAGE_EXECUTE_READWRITE || mbi.Protect & PAGE_EXECUTE_WRITECOPY)) {
-                exec_regions.push_back(mbi);
-            }
+    //     while (VirtualQueryEx(hProcess, current_address, &mbi, sizeof(mbi))) {
+    //         if (mbi.State == MEM_COMMIT && 
+    //             (mbi.Protect & PAGE_EXECUTE || mbi.Protect & PAGE_EXECUTE_READ || 
+    //              mbi.Protect & PAGE_EXECUTE_READWRITE || mbi.Protect & PAGE_EXECUTE_WRITECOPY)) {
+    //             exec_regions.push_back(mbi);
+    //         }
             
-            current_address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
-            if (current_address < mbi.BaseAddress) break; // 溢出檢查
-        }
+    //         current_address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+    //         if (current_address < mbi.BaseAddress) break; // 溢出檢查
+    //     }
         
-        // 調試輸出：顯示找到的可執行區域數量
-        std::string debug_msg = "*** SCATTERED ROP SCAN: Process=" + std::to_string(process_id) + 
-                              ", Found " + std::to_string(exec_regions.size()) + " executable regions ***";
-        controlled_log_output("scattered_rop_scan", debug_msg, 1, 60, "DEBUG");
+    //     // 調試輸出：顯示找到的可執行區域數量
+    //     std::string debug_msg = "*** SCATTERED ROP SCAN: Process=" + std::to_string(process_id) + 
+    //                           ", Found " + std::to_string(exec_regions.size()) + " executable regions ***";
+    //     controlled_log_output("scattered_rop_scan", debug_msg, 1, 60, "DEBUG");
         
-        // 掃描每個可執行區域尋找gadgets
-        std::vector<ROPGadget> found_gadgets;
-        std::vector<SyscallROPChain> syscall_chains;
+    //     // 掃描每個可執行區域尋找gadgets
+    //     std::vector<ROPGadget> found_gadgets;
+    //     std::vector<SyscallROPChain> syscall_chains;
         
-        // 獲取進程類別
-        std::string process_name = MemoryMonitor::get_process_name(process_id);
-        ProcessCategory category = classify_process(process_name);
-        bool is_simulator = (category == ProcessCategory::ATTACK_SIMULATOR);
+    //     // 獲取進程類別
+    //     std::string process_name = MemoryMonitor::get_process_name(process_id);
+    //     ProcessCategory category = classify_process(process_name);
+    //     bool is_simulator = (category == ProcessCategory::ATTACK_SIMULATOR);
         
-        for (const auto& region : exec_regions) {
-            // 使用性能優化參數限制掃描大小
-            if (region.RegionSize > PerformanceConfig::MAX_SCAN_SIZE) continue;
+    //     for (const auto& region : exec_regions) {
+    //         // 使用性能優化參數限制掃描大小
+    //         if (region.RegionSize > PerformanceConfig::MAX_SCAN_SIZE) continue;
             
-            // 對於攻擊模擬器，添加額外的過濾條件
-            if (is_simulator) {
-                // 跳過系統模組和已知的合法代碼區域
-                if (is_legitimate_code_region(hProcess, region.BaseAddress, region.RegionSize)) {
-                    continue;
-                }
+    //         // 對於攻擊模擬器，添加額外的過濾條件
+    //         if (is_simulator) {
+    //             // 跳過系統模組和已知的合法代碼區域
+    //             if (is_legitimate_code_region(hProcess, region.BaseAddress, region.RegionSize)) {
+    //                 continue;
+    //             }
                 
-                // 檢查記憶體保護屬性，優先掃描可寫可執行區域
-                if (!(region.Protect & PAGE_EXECUTE_READWRITE)) {
-                    continue;
-                }
+    //             // 檢查記憶體保護屬性，優先掃描可寫可執行區域
+    //             if (!(region.Protect & PAGE_EXECUTE_READWRITE)) {
+    //                 continue;
+    //             }
                 
-                // 新增：針對攻擊模擬器，降低過濾條件，確保能檢測到攻擊
-                // 檢查是否為最近分配的記憶體區域（可選，不強制要求）
-                bool is_recent = is_recently_allocated_memory(hProcess, region.BaseAddress);
-                if (!is_recent) {
-                    // 如果不是最近分配的，仍然掃描，但降低優先級
-                    controlled_log_output("recent_allocation", 
-                        "*** SCANNING OLDER REGION: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
-                        ", Size=" + std::to_string(region.RegionSize) + " ***", 1, 60, "DEBUG");
-                }
+    //             // 新增：針對攻擊模擬器，降低過濾條件，確保能檢測到攻擊
+    //             // 檢查是否為最近分配的記憶體區域（可選，不強制要求）
+    //             bool is_recent = is_recently_allocated_memory(hProcess, region.BaseAddress);
+    //             if (!is_recent) {
+    //                 // 如果不是最近分配的，仍然掃描，但降低優先級
+    //                 controlled_log_output("recent_allocation", 
+    //                     "*** SCANNING OLDER REGION: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
+    //                     ", Size=" + std::to_string(region.RegionSize) + " ***", 1, 60, "DEBUG");
+    //             }
                 
-                // 新增：檢查記憶體區域的熵值（高熵值更可能是shellcode）
-                std::vector<uint8_t> entropy_buffer(std::min(region.RegionSize, (SIZE_T)1024));
-                SIZE_T entropy_bytes_read = 0;
-                if (ReadProcessMemory(hProcess, region.BaseAddress, entropy_buffer.data(), entropy_buffer.size(), &entropy_bytes_read)) {
-                    double entropy = MemoryMonitor::calculate_shannon_entropy(entropy_buffer.data(), entropy_bytes_read, "simulator");
-                    if (entropy < 2.0) { // 降低熵值閾值，適應更多攻擊模式
-                        controlled_log_output("entropy_check", 
-                            "*** LOW ENTROPY REGION SKIPPED: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
-                            ", Entropy=" + std::to_string(entropy) + " ***", 1, 60, "DEBUG");
-                        continue;
-                    }
-                }
+    //             // 新增：檢查記憶體區域的熵值（高熵值更可能是shellcode）
+    //             std::vector<uint8_t> entropy_buffer(std::min(region.RegionSize, (SIZE_T)1024));
+    //             SIZE_T entropy_bytes_read = 0;
+    //             if (ReadProcessMemory(hProcess, region.BaseAddress, entropy_buffer.data(), entropy_buffer.size(), &entropy_bytes_read)) {
+    //                 double entropy = MemoryMonitor::calculate_shannon_entropy(entropy_buffer.data(), entropy_bytes_read, "simulator");
+    //                 if (entropy < 2.0) { // 降低熵值閾值，適應更多攻擊模式
+    //                     controlled_log_output("entropy_check", 
+    //                         "*** LOW ENTROPY REGION SKIPPED: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
+    //                         ", Entropy=" + std::to_string(entropy) + " ***", 1, 60, "DEBUG");
+    //                     continue;
+    //                 }
+    //             }
                 
-                // 新增：檢查是否為動態分配的堆積區域
-                if (is_dynamic_heap_region(hProcess, region.BaseAddress)) {
-                    // 對於動態堆積區域，降低掃描頻率但提高檢測敏感度
-                    static std::map<uint64_t, std::chrono::steady_clock::time_point> last_heap_scan;
-                    auto now = std::chrono::steady_clock::now();
-                    auto last_scan = last_heap_scan.find((uint64_t)region.BaseAddress);
+    //             // 新增：檢查是否為動態分配的堆積區域
+    //             if (is_dynamic_heap_region(hProcess, region.BaseAddress)) {
+    //                 // 對於動態堆積區域，降低掃描頻率但提高檢測敏感度
+    //                 static std::map<uint64_t, std::chrono::steady_clock::time_point> last_heap_scan;
+    //                 auto now = std::chrono::steady_clock::now();
+    //                 auto last_scan = last_heap_scan.find((uint64_t)region.BaseAddress);
                     
-                    if (last_scan != last_heap_scan.end()) {
-                        auto time_diff = std::chrono::duration_cast<std::chrono::seconds>(now - last_scan->second);
-                        if (time_diff.count() < 5) { // 5秒內不重複掃描同一區域
-                            continue;
-                        }
-                    }
-                    last_heap_scan[(uint64_t)region.BaseAddress] = now;
-                }
+    //                 if (last_scan != last_heap_scan.end()) {
+    //                     auto time_diff = std::chrono::duration_cast<std::chrono::seconds>(now - last_scan->second);
+    //                     if (time_diff.count() < 5) { // 5秒內不重複掃描同一區域
+    //                         continue;
+    //                     }
+    //                 }
+    //                 last_heap_scan[(uint64_t)region.BaseAddress] = now;
+    //             }
                 
-                // 新增：檢查記憶體區域的執行歷史
-                if (has_recent_execution_activity(hProcess, region.BaseAddress)) {
-                    // 有執行活動的區域更可能是攻擊目標
-                    controlled_log_output("execution_activity", 
-                        "*** EXECUTION ACTIVITY DETECTED: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
-                        ", Size=" + std::to_string(region.RegionSize) + " ***", 1, 30, "DEBUG");
-                }
-            }
+    //             // 新增：檢查記憶體區域的執行歷史
+    //             if (has_recent_execution_activity(hProcess, region.BaseAddress)) {
+    //                 // 有執行活動的區域更可能是攻擊目標
+    //                 controlled_log_output("execution_activity", 
+    //                     "*** EXECUTION ACTIVITY DETECTED: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
+    //                     ", Size=" + std::to_string(region.RegionSize) + " ***", 1, 30, "DEBUG");
+    //             }
+    //         }
             
-            // 調試輸出：顯示正在掃描的區域（改為DEBUG級別，減少輸出頻率）
-            std::string region_debug = "*** SCANNING REGION: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
-                                     ", Size=" + std::to_string(region.RegionSize) + 
-                                     ", Protection=0x" + std::to_string(region.Protect) + " ***";
-            controlled_log_output("region_scan", region_debug, 1, 120, "DEBUG");
+    //         // 調試輸出：顯示正在掃描的區域（改為DEBUG級別，減少輸出頻率）
+    //         std::string region_debug = "*** SCANNING REGION: Base=0x" + format_address((uint64_t)region.BaseAddress) + 
+    //                                  ", Size=" + std::to_string(region.RegionSize) + 
+    //                                  ", Protection=0x" + std::to_string(region.Protect) + " ***";
+    //         controlled_log_output("region_scan", region_debug, 1, 120, "DEBUG");
             
-            std::vector<uint8_t> buffer(region.RegionSize);
-            SIZE_T bytes_read = 0;
+    //         std::vector<uint8_t> buffer(region.RegionSize);
+    //         SIZE_T bytes_read = 0;
             
-            if (ReadProcessMemory(hProcess, region.BaseAddress, buffer.data(), region.RegionSize, &bytes_read)) {
-                // 同時進行一般ROP檢測和系統調用ROP檢測
-                for (size_t i = 0; i < bytes_read - 8; i += PerformanceConfig::SCAN_STEP_SIZE) {
-                    // 檢查RET指令
-                    if (buffer[i] == 0xC3) {
-                        // 分析前面的指令
-                        std::vector<uint8_t> gadget_bytes;
-                        std::string instruction = "";
+    //         if (ReadProcessMemory(hProcess, region.BaseAddress, buffer.data(), region.RegionSize, &bytes_read)) {
+    //             // 同時進行一般ROP檢測和系統調用ROP檢測
+    //             for (size_t i = 0; i < bytes_read - 8; i += PerformanceConfig::SCAN_STEP_SIZE) {
+    //                 // 檢查RET指令
+    //                 if (buffer[i] == 0xC3) {
+    //                     // 分析前面的指令
+    //                     std::vector<uint8_t> gadget_bytes;
+    //                     std::string instruction = "";
                         
-                        // 收集gadget字節（使用優化的最大大小）
-                        size_t start = (i >= PerformanceConfig::MAX_GADGET_SIZE) ? i - PerformanceConfig::MAX_GADGET_SIZE : 0;
-                        for (size_t j = start; j <= i; j++) {
-                            gadget_bytes.push_back(buffer[j]);
-                        }
+    //                     // 收集gadget字節（使用優化的最大大小）
+    //                     size_t start = (i >= PerformanceConfig::MAX_GADGET_SIZE) ? i - PerformanceConfig::MAX_GADGET_SIZE : 0;
+    //                     for (size_t j = start; j <= i; j++) {
+    //                         gadget_bytes.push_back(buffer[j]);
+    //                     }
                         
-                        // 使用增強的指令分析
-                        if (gadget_bytes.size() >= 2) {
-                            uint8_t prev = gadget_bytes[gadget_bytes.size() - 2];
-                            if (prev >= 0x58 && prev <= 0x5F) {
-                                instruction = "pop r32; ret";
-                            } else if (prev == 0x94) {
-                                instruction = "xchg eax, esp; ret";
-                            } else if (gadget_bytes.size() >= 4) {
-                                if (gadget_bytes[gadget_bytes.size() - 4] == 0x83 && 
-                                    gadget_bytes[gadget_bytes.size() - 3] == 0xC4) {
-                                    instruction = "add esp, XX; ret";
-                                }
-                            } else {
-                                instruction = "ret";
-                            }
-                        }
+    //                     // 使用增強的指令分析
+    //                     if (gadget_bytes.size() >= 2) {
+    //                         uint8_t prev = gadget_bytes[gadget_bytes.size() - 2];
+    //                         if (prev >= 0x58 && prev <= 0x5F) {
+    //                             instruction = "pop r32; ret";
+    //                         } else if (prev == 0x94) {
+    //                             instruction = "xchg eax, esp; ret";
+    //                         } else if (gadget_bytes.size() >= 4) {
+    //                             if (gadget_bytes[gadget_bytes.size() - 4] == 0x83 && 
+    //                                 gadget_bytes[gadget_bytes.size() - 3] == 0xC4) {
+    //                                 instruction = "add esp, XX; ret";
+    //                             }
+    //                         } else {
+    //                             instruction = "ret";
+    //                         }
+    //                     }
                         
-                        uint64_t gadget_address = (uint64_t)region.BaseAddress + i;
-                        ROPGadget gadget(gadget_address, gadget_bytes, instruction);
-                        found_gadgets.push_back(gadget);
-                    }
-                }
+    //                     uint64_t gadget_address = (uint64_t)region.BaseAddress + i;
+    //                     ROPGadget gadget(gadget_address, gadget_bytes, instruction);
+    //                     found_gadgets.push_back(gadget);
+    //                 }
+    //             }
                 
-                // 在相同的緩衝區中檢測系統調用ROP鏈
-                detect_syscall_rop_chains(buffer, (uint64_t)region.BaseAddress, syscall_chains);
-            }
-        }
+    //             // 在相同的緩衝區中檢測系統調用ROP鏈
+    //             detect_syscall_rop_chains(buffer, (uint64_t)region.BaseAddress, syscall_chains);
+    //         }
+    //     }
         
-        // 分析gadget分佈模式（改為DEBUG級別）
-        std::string gadget_debug = "*** GADGET SCAN COMPLETE: Found " + std::to_string(found_gadgets.size()) + " gadgets ***";
-        controlled_log_output("gadget_scan", gadget_debug, 1, 60, "DEBUG");
+    //     // 分析gadget分佈模式（改為DEBUG級別）
+    //     std::string gadget_debug = "*** GADGET SCAN COMPLETE: Found " + std::to_string(found_gadgets.size()) + " gadgets ***";
+    //     controlled_log_output("gadget_scan", gadget_debug, 1, 60, "DEBUG");
         
-        // 報告系統調用ROP鏈檢測結果
-        if (!syscall_chains.empty()) {
-            report_syscall_rop_detection(process_id, syscall_chains);
-        }
+    //     // 報告系統調用ROP鏈檢測結果
+    //     if (!syscall_chains.empty()) {
+    //         report_syscall_rop_detection(process_id, syscall_chains);
+    //     }
         
-        if (found_gadgets.size() >= PerformanceConfig::MIN_GADGET_COUNT) { // 使用優化的最小gadget數量
-            analyze_gadget_distribution(process_id, found_gadgets);
-        }
-    }
+    //     if (found_gadgets.size() >= PerformanceConfig::MIN_GADGET_COUNT) { // 使用優化的最小gadget數量
+    //         analyze_gadget_distribution(process_id, found_gadgets);
+    //     }
+    // }
     
     void analyze_gadget_distribution(DWORD process_id, const std::vector<ROPGadget>& gadgets) {
         // 檢查gadget的分佈特徵
@@ -3180,110 +3243,110 @@ private:
 
     // 使用已定義的記憶體緩存結構和變數
     
-    // 新增：智能掃描函數
-    void smart_scan_process(DWORD process_id, HANDLE hProcess, ProcessCategory category) {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
+    // // 新增：智能掃描函數
+    // void smart_scan_process(DWORD process_id, HANDLE hProcess, ProcessCategory category) {
+    //     std::lock_guard<std::mutex> lock(cache_mutex_);
         
-        // 調試輸出：確認函數被調用
-        if (category == ProcessCategory::ATTACK_SIMULATOR) {
-            std::cout << "    *** smart_scan_process called for attack simulator ***" << std::endl;
-            log_message("DEBUG", "*** smart_scan_process called for attack simulator ***");
-        }
+    //     // 調試輸出：確認函數被調用
+    //     if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //         std::cout << "    *** smart_scan_process called for attack simulator ***" << std::endl;
+    //         log_message("DEBUG", "*** smart_scan_process called for attack simulator ***");
+    //     }
         
-        auto now = std::chrono::steady_clock::now();
-        auto cache_it = memory_cache_.find(process_id);
+    //     auto now = std::chrono::steady_clock::now();
+    //     auto cache_it = memory_cache_.find(process_id);
         
-        // 檢查是否需要更新緩存
-        bool need_cache_update = false;
-        if (cache_it == memory_cache_.end()) {
-            need_cache_update = true;
-        } else {
-            // 檢查緩存是否過期（5秒）
-            auto cache_age = std::chrono::duration_cast<std::chrono::seconds>(now - cache_it->second[0].last_scan);
-            if (cache_age.count() > 5) {
-                need_cache_update = true;
-            }
-        }
+    //     // 檢查是否需要更新緩存
+    //     bool need_cache_update = false;
+    //     if (cache_it == memory_cache_.end()) {
+    //         need_cache_update = true;
+    //     } else {
+    //         // 檢查緩存是否過期（5秒）
+    //         auto cache_age = std::chrono::duration_cast<std::chrono::seconds>(now - cache_it->second[0].last_scan);
+    //         if (cache_age.count() > 5) {
+    //             need_cache_update = true;
+    //         }
+    //     }
         
-        if (need_cache_update) {
-            // 更新緩存
-            std::vector<CachedMemoryRegion> new_cache;
-            MEMORY_BASIC_INFORMATION mbi;
-            LPVOID current_address = 0;
+    //     if (need_cache_update) {
+    //         // 更新緩存
+    //         std::vector<CachedMemoryRegion> new_cache;
+    //         MEMORY_BASIC_INFORMATION mbi;
+    //         LPVOID current_address = 0;
             
-            int total_regions = 0;
-            int executable_regions = 0;
-            int heap_regions = 0;
+    //         int total_regions = 0;
+    //         int executable_regions = 0;
+    //         int heap_regions = 0;
             
-            while (VirtualQueryEx(hProcess, current_address, &mbi, sizeof(mbi))) {
-                total_regions++;
-                if (mbi.State == MEM_COMMIT) {
-                    // 分類記憶體區域
-                    bool is_executable = (mbi.Protect & PAGE_EXECUTE || mbi.Protect & PAGE_EXECUTE_READ || 
-                                        mbi.Protect & PAGE_EXECUTE_READWRITE || mbi.Protect & PAGE_EXECUTE_WRITECOPY);
-                    bool is_heap_like = (mbi.Protect & PAGE_READWRITE || mbi.Protect & PAGE_READONLY);
+    //         while (VirtualQueryEx(hProcess, current_address, &mbi, sizeof(mbi))) {
+    //             total_regions++;
+    //             if (mbi.State == MEM_COMMIT) {
+    //                 // 分類記憶體區域
+    //                 bool is_executable = (mbi.Protect & PAGE_EXECUTE || mbi.Protect & PAGE_EXECUTE_READ || 
+    //                                     mbi.Protect & PAGE_EXECUTE_READWRITE || mbi.Protect & PAGE_EXECUTE_WRITECOPY);
+    //                 bool is_heap_like = (mbi.Protect & PAGE_READWRITE || mbi.Protect & PAGE_READONLY);
                     
-                    if (is_executable || is_heap_like) {
-                        CachedMemoryRegion region((uint64_t)mbi.BaseAddress, mbi.RegionSize, mbi.Protect);
-                        region.is_executable = is_executable;  // 新增標記
-                        new_cache.push_back(region);
+    //                 if (is_executable || is_heap_like) {
+    //                     CachedMemoryRegion region((uint64_t)mbi.BaseAddress, mbi.RegionSize, mbi.Protect);
+    //                     region.is_executable = is_executable;  // 新增標記
+    //                     new_cache.push_back(region);
                         
-                        if (is_executable) executable_regions++;
-                        if (is_heap_like) heap_regions++;
-                    }
-                }
-                current_address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
-                if (current_address < mbi.BaseAddress) break;
-            }
+    //                     if (is_executable) executable_regions++;
+    //                     if (is_heap_like) heap_regions++;
+    //                 }
+    //             }
+    //             current_address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
+    //             if (current_address < mbi.BaseAddress) break;
+    //         }
             
-            // 調試輸出：顯示記憶體區域統計
-            if (category == ProcessCategory::ATTACK_SIMULATOR) {
-                std::string debug_key = "memory_stats_" + std::to_string(process_id);
-                std::string debug_msg = "*** Memory regions found: Total=" + std::to_string(total_regions) + 
-                                      ", Executable=" + std::to_string(executable_regions) + 
-                                      ", Heap=" + std::to_string(heap_regions) + 
-                                      ", Cached=" + std::to_string(new_cache.size()) + " ***";
-                controlled_console_output(debug_key, "    " + debug_msg, 1, 10);
-                controlled_log_output(debug_key, debug_msg, 1, 10);
-            }
+    //         // 調試輸出：顯示記憶體區域統計
+    //         if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //             std::string debug_key = "memory_stats_" + std::to_string(process_id);
+    //             std::string debug_msg = "*** Memory regions found: Total=" + std::to_string(total_regions) + 
+    //                                   ", Executable=" + std::to_string(executable_regions) + 
+    //                                   ", Heap=" + std::to_string(heap_regions) + 
+    //                                   ", Cached=" + std::to_string(new_cache.size()) + " ***";
+    //             controlled_console_output(debug_key, "    " + debug_msg, 1, 10);
+    //             controlled_log_output(debug_key, debug_msg, 1, 10);
+    //         }
             
-            memory_cache_[process_id] = new_cache;
-        }
+    //         memory_cache_[process_id] = new_cache;
+    //     }
         
-        // 對攻擊模擬器執行分散式ROP檢測
-        if (category == ProcessCategory::ATTACK_SIMULATOR) {
-            detect_scattered_rop_chains(process_id, hProcess);
-        }
+    //     // 對攻擊模擬器執行分散式ROP檢測
+    //     if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //         detect_scattered_rop_chains(process_id, hProcess);
+    //     }
         
-        // 智能掃描：根據區域類型執行不同的檢測
-        auto& cache = memory_cache_[process_id];
-        for (auto& region : cache) {
-            // 檢查是否需要掃描這個區域
-            auto region_age = std::chrono::duration_cast<std::chrono::seconds>(now - region.last_scan);
-            if (region_age.count() > 2) { // 2秒後重新掃描
-                region.last_scan = now;
+    //     // 智能掃描：根據區域類型執行不同的檢測
+    //     auto& cache = memory_cache_[process_id];
+    //     for (auto& region : cache) {
+    //         // 檢查是否需要掃描這個區域
+    //         auto region_age = std::chrono::duration_cast<std::chrono::seconds>(now - region.last_scan);
+    //         if (region_age.count() > 2) { // 2秒後重新掃描
+    //             region.last_scan = now;
                 
-                // 調試輸出：顯示區域信息
-                if (category == ProcessCategory::ATTACK_SIMULATOR) {
-                    std::string debug_key = "region_debug_" + std::to_string(process_id);
-                    std::string debug_msg = "*** Scanning region: 0x" + format_address(region.base_address) + 
-                                          ", size: " + std::to_string(region.size) + 
-                                          ", executable: " + (region.is_executable ? "YES" : "NO") + " ***";
-                    controlled_console_output(debug_key, "    " + debug_msg, 1, 10);
-                    controlled_log_output(debug_key, debug_msg, 1, 10);
-                }
+    //             // 調試輸出：顯示區域信息
+    //             if (category == ProcessCategory::ATTACK_SIMULATOR) {
+    //                 std::string debug_key = "region_debug_" + std::to_string(process_id);
+    //                 std::string debug_msg = "*** Scanning region: 0x" + format_address(region.base_address) + 
+    //                                       ", size: " + std::to_string(region.size) + 
+    //                                       ", executable: " + (region.is_executable ? "YES" : "NO") + " ***";
+    //                 controlled_console_output(debug_key, "    " + debug_msg, 1, 10);
+    //                 controlled_log_output(debug_key, debug_msg, 1, 10);
+    //             }
                 
-                // 分層檢測策略
-                if (region.is_executable) {
-                    // 可執行區域：執行 ROP 和 Shellcode 檢測
-                    check_executable_integrity_remote(hProcess, (LPVOID)region.base_address, region.size);
-                } else {
-                    // 非可執行區域：執行 Heap 檢測
-                    check_heap_region_remote(hProcess, (LPVOID)region.base_address, region.size);
-                }
-            }
-        }
-    }
+    //             // 分層檢測策略
+    //             if (region.is_executable) {
+    //                 // 可執行區域：執行 ROP 和 Shellcode 檢測
+    //                 check_executable_integrity_remote(hProcess, (LPVOID)region.base_address, region.size);
+    //             } else {
+    //                 // 非可執行區域：執行 Heap 檢測
+    //                 check_heap_region_remote(hProcess, (LPVOID)region.base_address, region.size);
+    //             }
+    //         }
+    //     }
+    // }
 
     // 使用已定義的模擬器輸出控制結構和變數
     
@@ -3744,55 +3807,55 @@ private:
         // 這裡可以添加更多的可疑行為檢測邏輯
     }
     
-    // 新增：整合的攻擊檢測函數
-    void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, ProcessCategory category) {
-        // 根據進程類別調整檢測策略
-        switch (category) {
-            case ProcessCategory::ATTACK_SIMULATOR:
-                // 對攻擊模擬器執行全面的檢測
-                detect_scattered_rop_chains(process_id, hProcess);
-                detect_complex_attack_patterns(process_id, hProcess);
-                detect_suspicious_behavior_patterns(process_id, hProcess);
-                detect_string_write_operations(process_id, hProcess);
+    // // 新增：整合的攻擊檢測函數
+    // void perform_comprehensive_attack_detection(DWORD process_id, HANDLE hProcess, ProcessCategory category) {
+    //     // 根據進程類別調整檢測策略
+    //     switch (category) {
+    //         case ProcessCategory::ATTACK_SIMULATOR:
+    //             // 對攻擊模擬器執行全面的檢測
+    //             detect_scattered_rop_chains(process_id, hProcess);
+    //             detect_complex_attack_patterns(process_id, hProcess);
+    //             detect_suspicious_behavior_patterns(process_id, hProcess);
+    //             detect_string_write_operations(process_id, hProcess);
                 
-                // 新增：針對攻擊模擬器的增強檢測
-                detect_attack_simulator_specific_patterns(process_id, hProcess);
+    //             // 新增：針對攻擊模擬器的增強檢測
+    //             detect_attack_simulator_specific_patterns(process_id, hProcess);
                 
-                // 調試輸出
-                controlled_log_output("comprehensive_detection", 
-                    "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
-                    ", Category=ATTACK_SIMULATOR ***", 1, 60, "DEBUG");
-                break;
+    //             // 調試輸出
+    //             controlled_log_output("comprehensive_detection", 
+    //                 "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
+    //                 ", Category=ATTACK_SIMULATOR ***", 1, 60, "DEBUG");
+    //             break;
                 
-            case ProcessCategory::HIGH_RISK_PROCESS:
-                // 對高風險進程執行重點檢測
-                detect_scattered_rop_chains(process_id, hProcess);
-                detect_complex_attack_patterns(process_id, hProcess);
+    //         case ProcessCategory::HIGH_RISK_PROCESS:
+    //             // 對高風險進程執行重點檢測
+    //             detect_scattered_rop_chains(process_id, hProcess);
+    //             detect_complex_attack_patterns(process_id, hProcess);
                 
-                controlled_log_output("comprehensive_detection", 
-                    "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
-                    ", Category=HIGH_RISK_PROCESS ***", 1, 60, "DEBUG");
-                break;
+    //             controlled_log_output("comprehensive_detection", 
+    //                 "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
+    //                 ", Category=HIGH_RISK_PROCESS ***", 1, 60, "DEBUG");
+    //             break;
                 
-            case ProcessCategory::USER_PROCESS:
-                // 對用戶進程執行基本檢測
-                detect_suspicious_behavior_patterns(process_id, hProcess);
+    //         case ProcessCategory::USER_PROCESS:
+    //             // 對用戶進程執行基本檢測
+    //             detect_suspicious_behavior_patterns(process_id, hProcess);
                 
-                controlled_log_output("comprehensive_detection", 
-                    "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
-                    ", Category=USER_PROCESS ***", 1, 120, "DEBUG");
-                break;
+    //             controlled_log_output("comprehensive_detection", 
+    //                 "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
+    //                 ", Category=USER_PROCESS ***", 1, 120, "DEBUG");
+    //             break;
                 
-            case ProcessCategory::SYSTEM_PROCESS:
-                // 對系統進程執行最小檢測
-                detect_suspicious_behavior_patterns(process_id, hProcess);
+    //         case ProcessCategory::SYSTEM_PROCESS:
+    //             // 對系統進程執行最小檢測
+    //             detect_suspicious_behavior_patterns(process_id, hProcess);
                 
-                controlled_log_output("comprehensive_detection", 
-                    "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
-                    ", Category=SYSTEM_PROCESS ***", 1, 300, "DEBUG");
-                break;
-        }
-    }
+    //             controlled_log_output("comprehensive_detection", 
+    //                 "*** COMPREHENSIVE DETECTION COMPLETED: Process=" + std::to_string(process_id) + 
+    //                 ", Category=SYSTEM_PROCESS ***", 1, 300, "DEBUG");
+    //             break;
+    //     }
+    // }
     
     // 新增：針對攻擊模擬器的特定模式檢測
     void detect_attack_simulator_specific_patterns(DWORD process_id, HANDLE hProcess) {
@@ -4086,7 +4149,7 @@ int main() {
         log_file.close();
     }
     
-    DetectionEngineImpl engine;
+    DetectionEngine engine;
     
     if (!engine.start()) {
         std::cerr << "Failed to start detection engine" << std::endl;
