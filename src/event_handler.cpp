@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <sstream>
 #include <mutex>
+#include <iomanip>
 
 namespace RealMemoryDetection {
     
@@ -1591,176 +1592,518 @@ void EventHandler::detect_attack_simulator_patterns(DWORD process_id, HANDLE hPr
     }
 }
 
-void EventHandler::detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess) {
-    try {
-        // 新增：關鍵 debug 日誌
-        log_to_detection_engine("DEBUG", "[SCATTER] start pid=" + std::to_string(process_id));
+// 輔助函數：檢查地址是否指向 gadget（ret 指令）
+static bool points_to_gadget(HANDLE hProcess, void* addr) {
+    uint8_t bytes[16];
+    SIZE_T read = 0;
+    
+    if (!ReadProcessMemory(hProcess, addr, bytes, sizeof(bytes), &read) || read < 1) {
+        return false;
+    }
+    
+    // 檢查是否指向 ret 指令 (0xC3)
+    if (bytes[0] == 0xC3) {
+        return true;
+    }
+    
+    // 檢查 ret imm16 (0xC2 XX XX)
+    if (bytes[0] == 0xC2 && read >= 3) {
+        return true;
+    }
+    
+    // 檢查 retf (0xCB) 或 retf imm16 (0xCA)
+    if (bytes[0] == 0xCB || bytes[0] == 0xCA) {
+        return true;
+    }
+    
+    // 檢查 pop; ret 模式（pop 在 0x58-0x5F 範圍）
+    if (read >= 2 && bytes[0] >= 0x58 && bytes[0] <= 0x5F && bytes[1] == 0xC3) {
+        return true;
+    }
+    
+    // 檢查 leave; ret (leave = 0xC9)
+    if (read >= 2 && bytes[0] == 0xC9 && bytes[1] == 0xC3) {
+        return true;
+    }
+    
+    // 檢查 xchg eax,esp; ret (xchg = 0x94)
+    if (read >= 2 && bytes[0] == 0x94 && bytes[1] == 0xC3) {
+        return true;
+    }
+    
+    return false;
+}
+
+// 堆疊資訊結構
+struct StackInfo {
+    LPVOID base;        // 堆疊基址（高位址/頂部）
+    LPVOID limit;       // 堆疊限制（低位址/底部）
+    SIZE_T size;        // 堆疊大小
+    DWORD thread_id;    // 所屬執行緒 ID
+};
+
+// 定義必要的 Windows 內部結構（從 winternl.h）
+#ifndef WINNT
+typedef long NTSTATUS;
+#endif
+
+// NT_TIB 結構（簡化版，只包含我們需要的欄位）
+typedef struct _NT_TIB {
+    PVOID ExceptionList;  // EXCEPTION_REGISTRATION_RECORD*
+    PVOID StackBase;
+    PVOID StackLimit;
+    PVOID SubSystemTib;
+    union {
+        PVOID FiberData;
+        DWORD Version;
+    };
+    PVOID ArbitraryUserPointer;
+    struct _NT_TIB *Self;
+} NT_TIB, *PNT_TIB;
+
+// 定義 CLIENT_ID 結構
+typedef struct _CLIENT_ID {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} CLIENT_ID, *PCLIENT_ID;
+
+typedef struct _THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    KAFFINITY AffinityMask;
+    DWORD Priority;
+    DWORD BasePriority;
+} THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
+
+typedef enum _THREADINFOCLASS {
+    ThreadBasicInformation = 0,
+    ThreadTimes = 1,
+    ThreadPriority = 2,
+    ThreadBasePriority = 3,
+    ThreadAffinityMask = 4,
+    ThreadImpersonationToken = 5,
+    ThreadDescriptorTableEntry = 6,
+    ThreadEnableAlignmentFaultFixup = 7,
+    ThreadEventPair_Reusable = 8,
+    ThreadQuerySetWin32StartAddress = 9,
+    ThreadZeroTlsCell = 10,
+    ThreadPerformanceCount = 11,
+    ThreadAmILastThread = 12,
+    ThreadIdealProcessor = 13,
+    ThreadPriorityBoost = 14,
+    ThreadSetTlsArrayAddress = 15,
+    ThreadIsIoPending = 16,
+    ThreadHideFromDebugger = 17,
+    ThreadBreakOnTermination = 18,
+    ThreadSwitchLegacyState = 19,
+    ThreadIsTerminated = 20,
+    ThreadLastSystemCall = 21,
+    ThreadIoPriority = 22,
+    ThreadCycleTime = 23,
+    ThreadPagePriority = 24,
+    ThreadActualBasePriority = 25,
+    ThreadTebInformation = 26,
+    ThreadCSwitchMon = 27,
+    ThreadCSwitchPmon = 28,
+    ThreadWow64Context = 29,
+    ThreadGroupInformation = 30,
+    ThreadUmsInformation = 31,
+    ThreadChannelInformation = 32,
+    ThreadDescription = 33,
+    ThreadActualGroupAffinity = 34,
+    ThreadDynamicCodePolicyInfo = 35,
+    ThreadExplicitCaseSensitivity = 36,
+    ThreadSubsystemInformation = 37,
+    ThreadDbgkWerReportActive = 38,
+    ThreadAttachContainer = 39,
+    ThreadAttachSilo = 40
+} THREADINFOCLASS;
+
+// TEB 結構（部分，只包含我們需要的 NT_TIB）
+typedef struct _MY_TEB {
+    NT_TIB NtTib;
+    // ... 其他欄位我們不需要
+} MY_TEB, *PMY_TEB;
+
+// 獲取指定執行緒的堆疊資訊（通過 TEB）- 跨進程版本
+static bool get_thread_stack_info_via_teb(
+    HANDLE hProcess,    // 目標進程 handle
+    HANDLE hThread,     // 目標執行緒 handle
+    StackInfo& info
+) {
+    // 1. 獲取 TEB 地址
+    typedef NTSTATUS (WINAPI *PNtQueryInformationThread)(
+        HANDLE ThreadHandle,
+        THREADINFOCLASS ThreadInformationClass,
+        PVOID ThreadInformation,
+        ULONG ThreadInformationLength,
+        PULONG ReturnLength
+    );
+    
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    if (!ntdll) {
+        return false;
+    }
+    
+    auto NtQueryInformationThread = (PNtQueryInformationThread)
+        GetProcAddress(ntdll, "NtQueryInformationThread");
+    if (!NtQueryInformationThread) {
+        return false;
+    }
+    
+    THREAD_BASIC_INFORMATION tbi = {0};
+    ULONG return_length = 0;
+    
+    NTSTATUS status = NtQueryInformationThread(
+        hThread,
+        ThreadBasicInformation,
+        &tbi,
+        sizeof(tbi),
+        &return_length
+    );
+    
+    // NTSTATUS 成功是 0 (STATUS_SUCCESS)，失敗是負數
+    if (status != 0) {
+        return false;
+    }
+    
+    if (!tbi.TebBaseAddress) {
+        return false;
+    }
+    
+    // 2. 遠端讀取 TEB（只讀取 NT_TIB 部分）
+    MY_TEB teb = {0};
+    SIZE_T bytes_read = 0;
+    
+    if (!ReadProcessMemory(
+        hProcess,
+        tbi.TebBaseAddress,
+        &teb,
+        sizeof(NT_TIB),  // 只讀取 NT_TIB 部分
+        &bytes_read
+    )) {
+        return false;
+    }
+    
+    if (bytes_read < sizeof(NT_TIB)) {
+        return false;
+    }
+    
+    // 3. 從 TEB 中提取堆疊資訊
+    info.base = teb.NtTib.StackBase;      // 堆疊頂部（高位址）
+    info.limit = teb.NtTib.StackLimit;    // 堆疊底部（低位址）
+    
+    // 計算堆疊大小（StackBase > StackLimit，堆疊向下增長）
+    if (info.base && info.limit && info.base > info.limit) {
+        info.size = (SIZE_T)((BYTE*)info.base - (BYTE*)info.limit);
+        info.thread_id = GetThreadId(hThread);
+        return true;
+    }
+    
+    return false;
+}
+
+// 輔助函數：判斷記憶體區域是否為堆疊（啟發式方法）
+static bool is_likely_stack_region_heuristic(const MEMORY_BASIC_INFORMATION& mbi) {
+    // 1. 必須是已提交的記憶體
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    
+    // 2. 類型通常是 MEM_PRIVATE
+    if (mbi.Type != MEM_PRIVATE) {
+        return false;
+    }
+    
+    // 3. 保護屬性通常是 PAGE_READWRITE（有時是 PAGE_EXECUTE_READWRITE）
+    if (!(mbi.Protect & PAGE_READWRITE) && 
+        !(mbi.Protect & PAGE_EXECUTE_READWRITE)) {
+        return false;
+    }
+    
+    // 4. 大小通常在 64KB - 8MB 之間（可調整）
+    SIZE_T size = mbi.RegionSize;
+    if (size < 64 * 1024 || size > 8 * 1024 * 1024) {
+        return false;
+    }
+    
+    // 5. 檢查是否有 guard page（堆疊保護頁）- 這是堆疊的強烈特徵
+    // 注意：這個檢查需要目標進程的 handle，但我們只有 mbi，所以跳過這個檢查
+    // 實際使用時會通過參數傳入 hProcess，但在這個啟發式函數中我們簡化處理
+    
+    // 6. 在 32-bit 系統上，堆疊通常在高位址
+#ifdef _WIN32
+#ifndef _WIN64
+    if ((DWORD_PTR)mbi.BaseAddress < 0x00100000) {
+        return false;
+    }
+#endif
+#endif
+    
+    // 符合大部分特徵
+    return true;
+}
+
+// 輔助函數：獲取進程所有執行緒的堆疊區域（優先使用 TEB，失敗時回退到啟發式）
+static std::vector<MEMORY_BASIC_INFORMATION> get_thread_stacks(DWORD process_id, HANDLE hProcess) {
+    std::vector<MEMORY_BASIC_INFORMATION> stack_regions;
+    std::unordered_set<LPVOID> seen_bases;  // 用於去重
+    
+    // ✅ 方法 1：優先使用 TEB（最準確）
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te32;
+        te32.dwSize = sizeof(THREADENTRY32);
         
-        // 獲取進程的所有可執行記憶體區域
-        std::vector<MEMORY_BASIC_INFORMATION> exec_regions;
+        if (Thread32First(snapshot, &te32)) {
+            do {
+                // 只處理目標進程的執行緒
+                if (te32.th32OwnerProcessID != process_id) {
+                    continue;
+                }
+                
+                // 打開執行緒
+                HANDLE hThread = OpenThread(
+                    THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT,
+                    FALSE,
+                    te32.th32ThreadID
+                );
+                
+                if (hThread) {
+                    StackInfo stack_info = {0};
+                    
+                    // 嘗試使用 TEB 方法獲取堆疊資訊
+                    if (get_thread_stack_info_via_teb(hProcess, hThread, stack_info)) {
+                        // 轉換為 MEMORY_BASIC_INFORMATION
+                        MEMORY_BASIC_INFORMATION mbi = {0};
+                        mbi.BaseAddress = stack_info.limit;  // 堆疊底部
+                        mbi.RegionSize = stack_info.size;
+                        mbi.State = MEM_COMMIT;
+                        mbi.Type = MEM_PRIVATE;
+                        mbi.Protect = PAGE_READWRITE;
+                        
+                        // 去重檢查
+                        if (seen_bases.find(mbi.BaseAddress) == seen_bases.end()) {
+                            stack_regions.push_back(mbi);
+                            seen_bases.insert(mbi.BaseAddress);
+                        }
+                    } else {
+                        // TEB 方法失敗，回退到 Context 方法
+                        CONTEXT ctx = {0};
+                        ctx.ContextFlags = CONTEXT_CONTROL;
+                        
+                        if (GetThreadContext(hThread, &ctx)) {
+#ifdef _WIN64
+                            void* stack_ptr = (void*)ctx.Rsp;
+#else
+                            void* stack_ptr = (void*)ctx.Esp;
+#endif
+                            
+                            // 查詢堆疊指標所在的記憶體區域
+                            MEMORY_BASIC_INFORMATION mbi;
+                            if (VirtualQueryEx(hProcess, stack_ptr, &mbi, sizeof(mbi))) {
+                                if (is_likely_stack_region_heuristic(mbi)) {
+                                    if (seen_bases.find(mbi.BaseAddress) == seen_bases.end()) {
+                                        stack_regions.push_back(mbi);
+                                        seen_bases.insert(mbi.BaseAddress);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    CloseHandle(hThread);
+                }
+            } while (Thread32Next(snapshot, &te32));
+        }
+        
+        CloseHandle(snapshot);
+    }
+    
+    // ✅ 方法 2：如果 TEB 方法完全失敗，使用啟發式掃描所有記憶體區域
+    if (stack_regions.empty()) {
         LPVOID current_address = 0;
         MEMORY_BASIC_INFORMATION mbi;
         
         while (VirtualQueryEx(hProcess, current_address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0) {
-                exec_regions.push_back(mbi);
+            if (mbi.State == MEM_COMMIT && is_likely_stack_region_heuristic(mbi)) {
+                if (seen_bases.find(mbi.BaseAddress) == seen_bases.end()) {
+                    stack_regions.push_back(mbi);
+                    seen_bases.insert(mbi.BaseAddress);
+                }
             }
             
             current_address = (LPVOID)((uintptr_t)mbi.BaseAddress + mbi.RegionSize);
             if (current_address < mbi.BaseAddress) break;
         }
+    }
+    
+    return stack_regions;
+}
+
+void EventHandler::detect_scattered_rop_chains(DWORD process_id, HANDLE hProcess) {
+    try {
+        log_to_detection_engine("DEBUG", "[SCATTER-ROP] start pid=" + std::to_string(process_id) + " (scanning STACKS, not code)");
         
-        // 新增：詳細的區域掃描日誌
-        log_to_detection_engine("DEBUG", "[SCATTER] regions found pid=" + std::to_string(process_id) + " count=" + std::to_string(exec_regions.size()));
+        // ✅ 正確方法：獲取所有執行緒的堆疊區域
+        std::vector<MEMORY_BASIC_INFORMATION> stack_regions = get_thread_stacks(process_id, hProcess);
         
-        // 調試輸出：顯示找到的可執行區域數量
-        std::string debug_msg = "*** SCATTERED ROP SCAN: Process=" + std::to_string(process_id) + 
-                              ", Found " + std::to_string(exec_regions.size()) + " executable regions ***";
-        log_to_detection_engine("DEBUG", debug_msg);
-        
-        // 掃描每個可執行區域尋找gadgets
-        std::vector<ROPGadget> found_gadgets;
-        
-        for (const auto& region : exec_regions) {
-           // 使用性能優化參數：不跳過大區域，改為掃描至多 64KB 的窗口
-           SIZE_T to_scan = static_cast<SIZE_T>(std::min<uint64_t>(static_cast<uint64_t>(region.RegionSize), 64ULL * 1024ULL));
-           if (to_scan == 0) continue;
-
-           std::vector<uint8_t> buffer(to_scan);
-           SIZE_T bytes_read = 0;
-           
-           if (!ReadProcessMemory(hProcess, region.BaseAddress, buffer.data(), to_scan, &bytes_read) || bytes_read == 0) {
-               continue;
-           }
-
-           // 基本統計
-           size_t ret_like_count = 0;
-           size_t pop_count = 0;
-           size_t pop_ret_count = 0;
-           size_t pivot_count = 0;
-           size_t ret_sled_max = 0, ret_sled_cur = 0;
-           size_t nop_sled_max = 0, nop_sled_cur = 0;
-           size_t int3_sled_max = 0, int3_sled_cur = 0;
-
-           for (size_t i = 0; i < bytes_read; ++i) {
-               uint8_t b = buffer[i];
-               // sleds
-               if (b == 0x90) { // NOP
-                   ++nop_sled_cur; nop_sled_max = std::max(nop_sled_max, nop_sled_cur);
-               } else {
-                   nop_sled_cur = 0;
-               }
-               if (b == 0xCC) { // INT3
-                   ++int3_sled_cur; int3_sled_max = std::max(int3_sled_max, int3_sled_cur);
-               } else {
-                   int3_sled_cur = 0;
-               }
-               // ret-like
-               if (is_ret_like(b)) {
-                   ++ret_like_count;
-                   ++ret_sled_cur; ret_sled_max = std::max(ret_sled_max, ret_sled_cur);
-                   // pop; ret-like
-                   if (i >= 1) {
-                       uint8_t prev = buffer[i - 1];
-                       if (prev >= 0x58 && prev <= 0x5F) {
-                           ++pop_ret_count;
-                       }
-                       if (prev >= 0x58 && prev <= 0x5F) {
-                           // 同時計入 pop 統計
-                           ++pop_count;
-                       }
-                       // pivot 類型：leave; ret, xchg eax,esp; ret, add esp, imm; ret
-                       if (prev == 0x94 /* xchg eax, esp */ || prev == 0xC9 /* leave */) {
-                           ++pivot_count;
-                       }
-                       // add esp, imm8/imm32 之後接 ret-like（寬鬆模式：add 在 6 bytes 內）
-                       if (i >= 3 && buffer[i - 3] == 0x83 && buffer[i - 2] == 0xC4) {
-                           ++pivot_count;
-                       } else if (i >= 6 && buffer[i - 6] == 0x81 && buffer[i - 5] == 0xC4) {
-                           ++pivot_count;
-                       }
-                   }
-                   // 收集 ROPGadget（僅對 0xC3 保持舊語意）
-                   if (b == 0xC3) {
-                       std::vector<uint8_t> gadget_bytes;
-                       size_t start = (i >= 16) ? i - 16 : 0;
-                       for (size_t j = start; j <= i; ++j) gadget_bytes.push_back(buffer[j]);
-                       std::string instruction;
-                       if (!gadget_bytes.empty()) {
-                           uint8_t prev = gadget_bytes.size() >= 2 ? gadget_bytes[gadget_bytes.size() - 2] : 0;
-                           if (prev >= 0x58 && prev <= 0x5F) instruction = "pop r32; ret";
-                           else if (prev == 0x94) instruction = "xchg eax, esp; ret";
-                           else if (gadget_bytes.size() >= 4 && gadget_bytes[gadget_bytes.size() - 4] == 0x83 &&
-                                    gadget_bytes[gadget_bytes.size() - 3] == 0xC4) instruction = "add esp, XX; ret";
-                           else instruction = "ret";
-                       }
-                       uint64_t gadget_address = (uint64_t)region.BaseAddress + i;
-                       ROPGadget gadget(gadget_address, gadget_bytes, instruction);
-                       found_gadgets.push_back(gadget);
-                   }
-               } else {
-                   ret_sled_cur = 0;
-                   if (b >= 0x58 && b <= 0x5F) ++pop_count;
-               }
-           }
-
-           // 熵值估計
-           double entropy = 0.0;
-           try {
-               entropy = EventUtils::calculate_shannon_entropy(buffer.data(), bytes_read);
-           } catch (...) {
-               entropy = 0.0;
-           }
-           const double density = bytes_read ? static_cast<double>(ret_like_count) / static_cast<double>(bytes_read) : 0.0;
-           const bool is_private = (region.Type == MEM_PRIVATE);
-
-           // 簡單評分（需後續調參）
-           int score = 0;
-           if (density >= 0.03) score += 4;
-           else if (density >= 0.015) score += 2;
-           if (pivot_count >= 1 && density > 0.01) score += 2;
-           if (ret_sled_max >= 6) score += 2;
-           if (nop_sled_max >= 16) score += 1;
-           if (int3_sled_max >= 8) score += 1;
-           if (is_private) score += 1;
-           if (entropy <= 3.0 && density >= 0.01) score += 1;
-
-           // 若可疑，產出事件
-           if (score >= 5) {
-               std::ostringstream meta;
-               meta << "SCATTERED_ROP_HEURISTIC"
-                    << " ret_like=" << ret_like_count
-                    << " pop=" << pop_count
-                    << " pop_ret=" << pop_ret_count
-                    << " pivot=" << pivot_count
-                    << " density=" << density
-                    << " ret_sled_max=" << ret_sled_max
-                    << " nop_sled_max=" << nop_sled_max
-                    << " int3_sled_max=" << int3_sled_max
-                    << " entropy=" << entropy
-                    << " private=" << (is_private ? "Y" : "N")
-                    << " scanned=" << bytes_read;
-
-               Event ev = Event::make_event(Event::Type::CUSTOM, process_id, (uint64_t)region.BaseAddress, region.RegionSize);
-               ev.priority = EventPriority::HIGH;
-               ev.source = EventSource::DERIVED;
-               ev.meta = meta.str();
-               enqueue_event(ev);
-           }
-
-           // 對 MEM_PRIVATE + EXEC 小區域也納入 burst 偵測
-           if (is_private && region.RegionSize <= 16 * 1024) {
-               record_exec_private_small_region_burst(this, process_id, (uint64_t)region.BaseAddress, region.RegionSize);
-           }
+        if (stack_regions.empty()) {
+            log_to_detection_engine("DEBUG", "[SCATTER-ROP] no stack regions found pid=" + std::to_string(process_id));
+            return;
         }
         
-        // 分析gadget分佈模式
-        std::string gadget_debug = "*** GADGET SCAN COMPLETE: Found " + std::to_string(found_gadgets.size()) + " gadgets ***";
-        log_to_detection_engine("DEBUG", gadget_debug);
+        log_to_detection_engine("DEBUG", "[SCATTER-ROP] found " + std::to_string(stack_regions.size()) + " stack regions");
         
-        if (found_gadgets.size() >= 5) {
-            EventUtils::analyze_gadget_distribution(process_id, found_gadgets);
+        // 掃描每個堆疊區域
+        for (const auto& stack_region : stack_regions) {
+            // 限制掃描大小（堆疊通常不會太大，但我們限制在 512KB 以內）
+            SIZE_T to_scan = static_cast<SIZE_T>(std::min<uint64_t>(
+                static_cast<uint64_t>(stack_region.RegionSize), 
+                512ULL * 1024ULL));
+            
+            if (to_scan == 0 || to_scan < sizeof(void*)) {
+                continue;
+            }
+            
+            // 讀取堆疊內容
+            std::vector<uint8_t> stack_buffer(to_scan);
+            SIZE_T bytes_read = 0;
+            
+            if (!ReadProcessMemory(hProcess, stack_region.BaseAddress, 
+                                  stack_buffer.data(), to_scan, &bytes_read) || 
+                bytes_read < sizeof(void*)) {
+                continue;
+            }
+            
+            // 將堆疊內容視為指標陣列（假設 64 位系統，指針大小為 8 字節）
+            // 為了兼容，我們同時處理 32 位和 64 位
+#ifdef _WIN64
+            const size_t ptr_size = 8;
+#else
+            const size_t ptr_size = 4;
+#endif
+            
+            size_t ptr_count = bytes_read / ptr_size;
+            if (ptr_count == 0) continue;
+            
+            // 分析堆疊上的指標模式
+            int consecutive_gadget_pointers = 0;
+            int max_consecutive_gadgets = 0;
+            int total_gadget_pointers = 0;
+            std::unordered_set<void*> seen_gadgets;  // 用於計算不同 gadget 的數量
+            
+            // 掃描堆疊上的每個指標
+            for (size_t i = 0; i < ptr_count; i++) {
+                void* ptr = nullptr;
+                
+                if (ptr_size == 8) {
+                    ptr = *(void**)(stack_buffer.data() + i * 8);
+                } else {
+                    uint32_t ptr32 = *(uint32_t*)(stack_buffer.data() + i * 4);
+                    ptr = (void*)(uintptr_t)ptr32;
+                }
+                
+                // 過濾無效指標（NULL 或明顯不合理的值）
+                if (ptr == nullptr || 
+                    (uintptr_t)ptr < 0x10000) {  // 小於 64KB（通常是無效地址）
+                    consecutive_gadget_pointers = 0;
+                    continue;
+                }
+                
+                // 64 位系統：檢查是否在用戶空間範圍內（0x10000 到 0x7FFFFFFFFFFF）
+#ifdef _WIN64
+                if ((uintptr_t)ptr > 0x7FFFFFFFFFFFULL) {
+                    consecutive_gadget_pointers = 0;
+                    continue;
+                }
+#else
+                // 32 位系統：檢查是否在用戶空間範圍內（0x10000 到 0x7FFFFFFF）
+                if ((uintptr_t)ptr > 0x7FFFFFFF) {
+                    consecutive_gadget_pointers = 0;
+                    continue;
+                }
+#endif
+                
+                // ✅ 關鍵：檢查這個指標是否指向 gadget
+                if (points_to_gadget(hProcess, ptr)) {
+                    consecutive_gadget_pointers++;
+                    if (consecutive_gadget_pointers > max_consecutive_gadgets) {
+                        max_consecutive_gadgets = consecutive_gadget_pointers;
+                    }
+                    total_gadget_pointers++;
+                    seen_gadgets.insert(ptr);
+                } else {
+                    consecutive_gadget_pointers = 0;
+                }
+            }
+            
+            // ✅ 計算 gadget 指標密度
+            double gadget_density = ptr_count > 0 ? 
+                static_cast<double>(total_gadget_pointers) / static_cast<double>(ptr_count) : 0.0;
+            
+            // ✅ 評分系統：檢測 ROP 鏈特徵
+            int suspicious_score = 0;
+            
+            // 檢查 1：連續的 gadget 指標（這是最強烈的 ROP 信號）
+            if (max_consecutive_gadgets >= 5) {
+                suspicious_score += 10;
+            } else if (max_consecutive_gadgets >= 3) {
+                suspicious_score += 5;
+            }
+            
+            // 檢查 2：gadget 指標密度異常
+            if (gadget_density > 0.3) {  // 30% 以上的指標都指向 gadget
+                suspicious_score += 8;
+            } else if (gadget_density > 0.15) {
+                suspicious_score += 4;
+            }
+            
+            // 檢查 3：總 gadget 數量
+            if (total_gadget_pointers >= 10) {
+                suspicious_score += 5;
+            } else if (total_gadget_pointers >= 5) {
+                suspicious_score += 3;
+            }
+            
+            // 檢查 4：不同 gadget 的數量（指向多個不同的 gadget）
+            if (seen_gadgets.size() >= 5) {
+                suspicious_score += 3;
+            }
+            
+            // ✅ 如果評分超過閾值，發出警報
+            if (suspicious_score >= 15) {
+                std::ostringstream meta;
+                meta << "ROP_CHAIN_ON_STACK"
+                     << " consecutive_gadgets=" << max_consecutive_gadgets
+                     << " total_gadgets=" << total_gadget_pointers
+                     << " unique_gadgets=" << seen_gadgets.size()
+                     << " gadget_density=" << std::fixed << std::setprecision(3) << gadget_density
+                     << " score=" << suspicious_score
+                     << " stack_base=0x" << std::hex << (uint64_t)stack_region.BaseAddress << std::dec;
+                
+                Event ev = Event::make_event(Event::Type::CUSTOM, process_id, 
+                                            (uint64_t)stack_region.BaseAddress, 
+                                            stack_region.RegionSize);
+                ev.priority = EventPriority::CRITICAL;  // 使用 CRITICAL 優先級
+                ev.source = EventSource::DERIVED;
+                ev.meta = meta.str();
+                enqueue_event(ev);
+                
+                update_stats_on_finding();
+                
+                log_to_detection_engine("WARN", "*** ROP CHAIN DETECTED ON STACK: " + meta.str() + " ***");
+            } else if (suspicious_score >= 8) {
+                // 較低的分數但仍有可疑跡象，記錄為 DEBUG
+                log_to_detection_engine("DEBUG", "[SCATTER-ROP] suspicious pattern (score=" + 
+                                       std::to_string(suspicious_score) + ") consecutive=" + 
+                                       std::to_string(max_consecutive_gadgets));
+            }
         }
+        
+        log_to_detection_engine("DEBUG", "[SCATTER-ROP] completed pid=" + std::to_string(process_id));
+        
     } catch (const std::exception& e) {
         log_to_detection_engine("ERROR", "Scattered ROP chain detection exception: " + std::string(e.what()));
     } catch (...) {
